@@ -32,6 +32,7 @@
 #include "syslang.h"
 #include "SwitchStorageBridge.h"
 #include "usb_singstar_nx.h"
+#include "usb_mic_nx.h"
 #include "CheatManager.h"
 #include "ra_http.h"
 #ifdef USE_VULKAN
@@ -809,6 +810,17 @@ static void quick_menu_message(const char *key, const char *message, float durat
 
 static void quick_menu_status(const char *message) {
   quick_menu_message("nethersx2_quick_status", message, 3.0f);
+}
+
+/* Bridge mic_nx OSD notifications to the core's addKeyedOSDMessage. */
+static void mic_osd_bridge(const char *key, const char *msg, float duration)
+{
+  if (!nl.addKeyedOSDMessage || !NATIVE_CLASS)
+    return;
+  nl.addKeyedOSDMessage(fake_env, NATIVE_CLASS,
+                        jni_make_string(key),
+                        jni_make_string(msg),
+                        duration);
 }
 
 static void quick_menu_release_inputs(void) {
@@ -1929,6 +1941,13 @@ int main(void) {
       if (!quick_menu_hint_shown && frame_count >= 300) {
         quick_menu_status("Quick menu: L + R + Plus");
         quick_menu_hint_shown = 1;
+
+        /* Late-bind OSD + report mic status once the core can display it. */
+        mic_nx_set_osd_callback(mic_osd_bridge);
+        if (usb_singstar_nx_connected())
+          quick_menu_status("USB Mic: connected");
+        else
+          quick_menu_status("USB Mic: none (plug into dock USB-A)");
       }
     }
 
