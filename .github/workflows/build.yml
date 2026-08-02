@@ -3,18 +3,14 @@ name: Build NetherSX2 (SingStar USB mic)
 on:
   push:
     branches: [ main, master ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
+    paths-ignore: [ '**.md', 'docs/**' ]
   pull_request:
     branches: [ main, master ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
+    paths-ignore: [ '**.md', 'docs/**' ]
   workflow_dispatch:
     inputs:
       release:
-        description: 'Create a GitHub Release from this build'
+        description: 'Create a GitHub Release'
         required: false
         default: false
         type: boolean
@@ -24,47 +20,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ───────────────────────────────────────────────────────────────────────────
-  # Build — GL and VK renderers compiled in parallel.
-  #
-  # GL and VK are mutually exclusive at link time (both bundle conflicting
-  # copies of mesa util/nir/compiler object code).  They are built as two
-  # independent jobs and shipped as two separate .nro files.
-  # Users pick the one that matches their preferred renderer at launch.
-  # ───────────────────────────────────────────────────────────────────────────
   build:
-    name: Build (${{ matrix.renderer }})
+    name: Build
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        renderer: [ GL, VK ]
-
     container:
       image: devkitpro/devkita64:latest
 
     steps:
-      # ── 1. Checkout ─────────────────────────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      # ── 2. Install devkitPro packages ───────────────────────────────────────
       - name: Install devkitPro packages
         run: |
           dkp-pacman -Sy --noconfirm \
-            switch-dev \
-            switch-mesa \
-            switch-curl \
-            switch-zlib \
-            switch-libdrm_nouveau \
-            switch-mbedtls \
+            switch-dev switch-mesa switch-curl \
+            switch-zlib switch-libdrm_nouveau switch-mbedtls \
           || true
 
-      # ── 3. Cache cmake dependencies (libsmb2 + libusbhsfs) ─────────────────
       - name: Cache cmake dependencies
         id: cache-deps
         uses: actions/cache@v4
@@ -83,31 +58,95 @@ jobs:
             -G "Unix Makefiles"
           make -j$(nproc)
 
-      # ── 4. Build ─────────────────────────────────────────────────────────────
-      - name: Build (RENDERER=${{ matrix.renderer }})
-        run: make -j$(nproc) RENDERER=${{ matrix.renderer }}
+      # ── GL renderer (always built) ─────────────────────────────────────────
+      - name: Build GL
+        run: make -j$(nproc) RENDERER=GL
 
-      # ── 5. Rename output ─────────────────────────────────────────────────────
-      - name: Rename output
+      - name: Save GL NRO
+        run: cp NetherSX2_nx.nro NetherSX2_nx_gl.nro
+
+      # ── VK renderer (built only when vulkan-bundle release exists) ─────────
+      # vulkan/ is built once by build-vulkan.yml and stored as a release asset
+      # tagged "vulkan-bundle". If that release does not exist yet, VK is skipped.
+      - name: Check for vulkan-bundle release
+        id: vk_check
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          NAME="NetherSX2_nx-${{ matrix.renderer }}-${SHORT_SHA}"
-          mv NetherSX2_nx.nro ${NAME}.nro
-          echo "ARTIFACT_NAME=${NAME}" >> $GITHUB_ENV
-          echo "NRO_FILE=${NAME}.nro"  >> $GITHUB_ENV
+          CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/vulkan-bundle" \
+            || echo "000")
+          if [ "$CODE" = "200" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "No vulkan-bundle release found — skipping VK build."
+            echo "Run the 'Build Vulkan bundle' workflow once to enable VK builds."
+          fi
 
-      # ── 6. Upload artifact ───────────────────────────────────────────────────
-      - name: Upload NRO
+      - name: Download vulkan bundle
+        if: steps.vk_check.outputs.available == 'true'
+        run: |
+          ASSET_URL=$(curl -sf \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/vulkan-bundle" \
+            | grep -o '"browser_download_url":"[^"]*vulkan\.tar\.gz"' \
+            | grep -o 'https://[^"]*')
+          curl -sfL \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "$ASSET_URL" -o vulkan.tar.gz
+          tar -xzf vulkan.tar.gz
+
+      - name: Build VK
+        if: steps.vk_check.outputs.available == 'true'
+        run: |
+          make clean
+          make -j$(nproc) RENDERER=VK
+
+      - name: Save VK NRO
+        if: steps.vk_check.outputs.available == 'true'
+        run: cp NetherSX2_nx.nro NetherSX2_nx_vk.nro
+
+      # ── Rename and upload ──────────────────────────────────────────────────
+      - name: Compute short SHA
+        id: version
+        run: |
+          SHORT=$(git rev-parse --short HEAD)
+          echo "short_sha=$SHORT" >> $GITHUB_OUTPUT
+          TAG=$(git describe --tags --exact-match 2>/dev/null || true)
+          if [ -z "$TAG" ]; then
+            TAG="nightly-$SHORT"
+            echo "prerelease=true"  >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Rename GL
+        run: mv NetherSX2_nx_gl.nro "NetherSX2_nx-GL-${{ steps.version.outputs.short_sha }}.nro"
+
+      - name: Rename VK
+        if: steps.vk_check.outputs.available == 'true'
+        run: mv NetherSX2_nx_vk.nro "NetherSX2_nx-VK-${{ steps.version.outputs.short_sha }}.nro"
+
+      - name: Upload GL
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.NRO_FILE }}
+          name: NetherSX2_nx-GL-${{ steps.version.outputs.short_sha }}
+          path: NetherSX2_nx-GL-${{ steps.version.outputs.short_sha }}.nro
           retention-days: 30
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # Release — collects both NROs and publishes a GitHub Release.
-  # Runs on push to main/master or when workflow_dispatch release=true.
-  # ───────────────────────────────────────────────────────────────────────────
+      - name: Upload VK
+        if: steps.vk_check.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetherSX2_nx-VK-${{ steps.version.outputs.short_sha }}
+          path: NetherSX2_nx-VK-${{ steps.version.outputs.short_sha }}.nro
+          retention-days: 30
+
+  # ── Release ────────────────────────────────────────────────────────────────
   release:
     name: Create release
     needs: build
@@ -116,41 +155,33 @@ jobs:
       (github.event_name == 'push' &&
         (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
       || (github.event_name == 'workflow_dispatch' && inputs.release == true)
-
     permissions:
       contents: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download all NRO artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -lh dist/
-
-      - name: Compute version tag
+      - name: Compute tag
         id: version
         run: |
+          SHORT=$(git rev-parse --short HEAD)
           TAG=$(git describe --tags --exact-match 2>/dev/null || true)
           if [ -z "$TAG" ]; then
-            TAG="nightly-${GITHUB_SHA::7}"
-          fi
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          if [[ "$TAG" == nightly-* ]]; then
-            echo "prerelease=true" >> $GITHUB_OUTPUT
+            TAG="nightly-$SHORT"
+            echo "prerelease=true"  >> $GITHUB_OUTPUT
           else
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: "NetherSX2 ${{ steps.version.outputs.tag }} (SingStar USB mic)"
@@ -159,27 +190,14 @@ jobs:
           body: |
             ## NetherSX2 with SingStar USB microphone support
 
-            Built from commit `${{ github.sha }}`.
+            Built from `${{ github.sha }}`.
 
-            ### Which NRO should I use?
-
-            | File | Renderer | When to use |
-            |------|----------|-------------|
-            | `*-GL-*.nro` | OpenGL (switch-mesa GLES) | Broadest compatibility, stable |
-            | `*-VK-*.nro` | Vulkan (Mesa NVK) | Better performance on newer titles |
-
-            GL and VK cannot be combined in a single NRO (they link conflicting
-            copies of mesa internals). Choose one and rename it to
-            `NetherSX2_nx.nro` on your SD card.
+            | File | Renderer |
+            |------|----------|
+            | `*-GL-*.nro` | OpenGL — always built |
+            | `*-VK-*.nro` | Vulkan — built when vulkan-bundle release exists |
 
             ### SingStar mic setup
-            1. Plug the SingStar adapter (VID `0x1415`) into a USB-A port on the dock,
-               or via a **powered** USB-C OTG hub.
-            2. Launch the emulator — the mic appears automatically on PS2 USB Port 1.
-            3. Optional overrides in `sdmc:/switch/nethersx2/nethersx2.ini`:
-               ```ini
-               USB/Port1/Type = singstar
-               USB/Port1/singstar/player1_volume = 240
-               USB/Port1/singstar/player2_volume = 240
-               ```
+            Plug the adapter (VID `0x1415`) into a USB-A dock port or powered OTG hub.
+            The mic appears automatically on PS2 USB Port 1.
           files: dist/*.nro
