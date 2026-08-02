@@ -434,6 +434,16 @@ static void run_startup_sequence(void) {
   prefs_set_string("Logging/EnableVerbose", "0");
   prefs_set_string("Logging/EnableEEConsole", "0");
   prefs_set_string("Logging/EnableIOPConsole", "0");
+  /* Force SingStar USB device BEFORE applySettings / USBopen */
+  prefs_set_string("USB1/Type", "singstar");
+  prefs_set_string("USB1/DeviceType", "singstar");
+  prefs_set_string("USB1/Device", "singstar");
+  prefs_set_string("USB1/singstar_subtype", "0");
+  prefs_set_string("USB1/singstar_player1_device_name", "switch_usb_mic_0");
+  prefs_set_string("USB1/singstar_player2_device_name", "switch_usb_mic_1");
+  prefs_set_string("USB1/singstar_input_device_name", "switch_usb_mic_0");
+  prefs_set_string("USB1/singstar_input_latency", "20");
+  prefs_set_string("USB2/Type", "None");
   prefs_save();
 
   if (!nl.isBIOSAvailable(fake_env, NATIVE_CLASS))
@@ -1947,11 +1957,10 @@ int main(void) {
         {
           char line[192];
           snprintf(line, sizeof(line),
-                   "Mic: phys=%d aaudio_open=%d start=%d [%s]",
-                   usb_singstar_nx_connected(),
+                   "USB1/Type=%s open=%d start=%d",
+                   prefs_get_string("USB1/Type", "?"),
                    usb_singstar_open_count(),
-                   usb_singstar_start_count(),
-                   mic_nx_last_diag());
+                   usb_singstar_start_count());
           quick_menu_status(line);
         }
       }
