@@ -1998,3 +1998,4 @@ int main(void) {
   __libnx_exit(0);
   return 0;
 }
+}
