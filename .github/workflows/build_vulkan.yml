@@ -1,0 +1,175 @@
+name: Build Vulkan bundle
+
+# Run this workflow ONCE (manually) to compile Mesa NVK for Switch.
+# The result is stored as a release asset tagged "vulkan-bundle".
+# After that, every normal build picks it up automatically — no need
+# to run this again unless you want to update Mesa.
+#
+# Build time: up to 5 hours (Mesa + Rust + LLVM cross-compilation).
+# GitHub Actions free tier: 2000 min/month — budget accordingly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      nxvk_ref:
+        description: 'nxvk branch/tag to build'
+        default: 'switch'
+        type: string
+
+jobs:
+  build-vulkan:
+    name: Build Mesa NVK
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    container:
+      image: devkitpro/devkita64:latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout this repo (for release upload)
+        uses: actions/checkout@v4
+
+      # ── System dependencies ────────────────────────────────────────────────
+      - name: Install system packages
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            python3-pip bison flex curl ca-certificates pkg-config git \
+            build-essential cmake ninja-build \
+            llvm-15-dev clang-15 libclang-15-dev \
+            libclc-15-dev libclc-15 \
+            llvm-spirv-15 libllvmspirvlib-15-dev spirv-tools \
+            libdrm-dev glslang-tools
+          python3 -m pip install --break-system-packages --no-cache-dir \
+            'meson>=1.4' mako pyyaml
+
+      # ── SPIRV-Tools (Mesa 26+ requires >= 2024.1, Ubuntu ships 2023) ───────
+      - name: Cache SPIRV-Tools
+        id: spirv-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/spirv
+          key: spirv-tools-v2024.4-v1
+
+      - name: Build SPIRV-Tools
+        if: steps.spirv-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 -b v2024.4 \
+            https://github.com/KhronosGroup/SPIRV-Tools.git /tmp/spirv-src
+          HEADERS_REV=$(grep -oE "spirv_headers_revision'\\s*:\\s*'[0-9a-f]{40}" \
+            /tmp/spirv-src/DEPS | grep -oE "[0-9a-f]{40}")
+          git clone https://github.com/KhronosGroup/SPIRV-Headers.git \
+            /tmp/spirv-src/external/spirv-headers
+          git -C /tmp/spirv-src/external/spirv-headers checkout --detach "$HEADERS_REV"
+          cmake -S /tmp/spirv-src -B /tmp/spirv-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/spirv \
+            -DSPIRV_SKIP_TESTS=ON -DSPIRV_WERROR=OFF \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build /tmp/spirv-src/build -j$(nproc) --target install
+
+      - name: Expose newer SPIRV-Tools to pkg-config
+        run: |
+          export PKG_CONFIG_PATH=/opt/spirv/lib/pkgconfig:$PKG_CONFIG_PATH
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+      # ── Rust sysroot ───────────────────────────────────────────────────────
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-none
+
+      # ── Clone nxvk ────────────────────────────────────────────────────────
+      - name: Clone nxvk
+        run: |
+          git clone --depth 1 -b ${{ inputs.nxvk_ref }} \
+            https://github.com/PalindromicBreadLoaf/nxvk.git /work/nxvk
+
+      # ── Cache Rust build artifacts ────────────────────────────────────────
+      - name: Cache Rust/cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /work/nxvk/switch/build
+          key: nvk-rust-${{ inputs.nxvk_ref }}-${{ hashFiles('/work/nxvk/Cargo.lock') }}
+          restore-keys: nvk-rust-${{ inputs.nxvk_ref }}-
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Configure cross-compilation environment
+        run: |
+          cd /work/nxvk
+          cp -r switch/docker/cross-include/. /opt/switch-cross-include/
+          DKP=/opt/devkitpro
+          XDIR=$DKP/portlibs/switch/lib/pkgconfig
+          mkdir -p "$XDIR"
+          for name in libclc LLVMSPIRVLib SPIRV-Tools SPIRV-Tools-shared SPIRV-Headers; do
+            f=$(find /usr /opt/spirv -name "$name.pc" 2>/dev/null | head -1)
+            [ -n "$f" ] && cp "$f" "$XDIR/"
+          done
+
+      - name: Build Rust std sysroot
+        run: |
+          cd /work/nxvk
+          bash switch/rust/build-std-sysroot.sh
+
+      - name: Build Mesa NVK
+        run: |
+          cd /work/nxvk
+          bash switch/build/configure.sh
+          ninja -k0 -C switch/build/cross \
+            src/nouveau/vulkan/libvulkan_nouveau.so || true
+          echo "Archives produced:"
+          find switch/build/cross -name '*.a' | sort
+
+      # ── Package into vulkan/ directory matching NetherSX2 Makefile layout ─
+      # NetherSX2 expects:
+      #   vulkan/include/vulkan/vulkan_core.h
+      #   vulkan/lib/libnvk.a
+      #   vulkan/lib/libvulkan_lite_runtime.a  ... (23 archives total)
+      - name: Package vulkan/ directory
+        run: |
+          set -eux
+          BUILD=/work/nxvk/switch/build/cross
+          OUT=$GITHUB_WORKSPACE/vulkan
+          mkdir -p "$OUT/lib" "$OUT/include/vulkan"
+
+          # Headers — from the nxvk source tree
+          cp /work/nxvk/include/vulkan/vulkan_core.h "$OUT/include/vulkan/"
+          # Copy all additional Vulkan headers present
+          find /work/nxvk/include/vulkan -name '*.h' \
+            -exec cp {} "$OUT/include/vulkan/" \;
+
+          # Archives — copy every .a that Mesa produced; NetherSX2 links them
+          # all inside --start-group so order and completeness both matter.
+          find "$BUILD" -name '*.a' -exec cp {} "$OUT/lib/" \;
+
+          echo "vulkan/ contents:"
+          ls -lh "$OUT/lib/"
+          ls "$OUT/include/vulkan/"
+
+          # Verify the two archives the Makefile names explicitly are present
+          test -f "$OUT/lib/libnvk.a" || \
+            { echo "ERROR: libnvk.a not found"; exit 1; }
+
+      # ── Bundle and publish as release asset ───────────────────────────────
+      - name: Create vulkan.tar.gz
+        run: tar -czf vulkan.tar.gz vulkan/
+
+      - name: Publish as vulkan-bundle release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vulkan-bundle
+          name: "Vulkan bundle (Mesa NVK for Switch)"
+          prerelease: true
+          body: |
+            Prebuilt Mesa NVK static archives for Nintendo Switch (AArch64 Horizon).
+            Built from `PalindromicBreadLoaf/nxvk` ref `${{ inputs.nxvk_ref }}`.
+
+            This release is consumed automatically by the main build workflow —
+            you do not need to download it manually.
+
+            Re-run the **Build Vulkan bundle** workflow to update Mesa.
+          files: vulkan.tar.gz
