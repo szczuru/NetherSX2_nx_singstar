@@ -481,6 +481,11 @@ __attribute__((weak)) aaudio_result_t usb_singstar_close_hook(AAudioStream *s)
   { (void)s; return AAUDIO_ERROR_INVALID_HANDLE; }
 __attribute__((weak)) int64_t usb_singstar_getFramesRead_hook(AAudioStream *s)
   { (void)s; return -1; }
+__attribute__((weak)) int32_t usb_singstar_read_hook(AAudioStream *s, void *buf,
+                                                     int32_t num_frames,
+                                                     int64_t timeout_nanos)
+  { (void)s; (void)buf; (void)num_frames; (void)timeout_nanos;
+    return AAUDIO_ERROR_UNAVAILABLE; }
 
 // usb_singstar_nx.c sets this to 1 for streams it owns (INPUT direction).
 // Returns 0 for all normal OUTPUT streams.
@@ -693,4 +698,14 @@ aaudio_result_t AAudioStream_waitForStateChange(AAudioStream *s,
   }
   if (nextState) *nextState = cur;
   return AAUDIO_OK;
+}
+
+
+int32_t AAudioStream_read(AAudioStream *s, void *buffer, int32_t numFrames,
+                          int64_t timeoutNanoseconds) {
+  if (!s || !buffer || numFrames <= 0) return AAUDIO_ERROR_NULL;
+  if (usb_singstar_owns_stream(s))
+    return usb_singstar_read_hook(s, buffer, numFrames, timeoutNanoseconds);
+  /* OUTPUT streams are callback-driven; read is not supported. */
+  return AAUDIO_ERROR_UNAVAILABLE;
 }
