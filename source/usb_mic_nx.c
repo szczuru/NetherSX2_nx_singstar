@@ -116,17 +116,45 @@ static int        g_iface_event_ok = 0;
 static u8         g_iface_event_index = 1; /* 0 often taken by libusbhsfs */
 
 static mic_nx_osd_fn g_osd_cb = NULL;
-static char          g_last_diag[128];
+static char          g_last_diag[128] = "not-probed";
+
+/* Queue up to 4 OSD messages until the callback is registered from main.c */
+#define OSD_Q_MAX 4
+static struct { char key[32]; char msg[160]; float dur; } g_osd_q[OSD_Q_MAX];
+static int g_osd_q_len = 0;
 
 void mic_nx_set_osd_callback(mic_nx_osd_fn fn)
 {
     g_osd_cb = fn;
+    /* Flush any messages that fired before the core OSD was ready. */
+    if (fn) {
+        for (int i = 0; i < g_osd_q_len; i++)
+            fn(g_osd_q[i].key, g_osd_q[i].msg, g_osd_q[i].dur);
+        g_osd_q_len = 0;
+        /* Always re-show current status once callback is live. */
+        if (g_last_diag[0])
+            fn("usb_mic_diag", g_last_diag, 8.0f);
+    }
 }
 
 static void osd(const char *key, const char *msg, float dur)
 {
-    if (g_osd_cb)
+    if (g_osd_cb) {
         g_osd_cb(key, msg, dur);
+        return;
+    }
+    if (g_osd_q_len < OSD_Q_MAX) {
+        snprintf(g_osd_q[g_osd_q_len].key, sizeof(g_osd_q[0].key), "%s", key);
+        snprintf(g_osd_q[g_osd_q_len].msg, sizeof(g_osd_q[0].msg), "%s", msg);
+        g_osd_q[g_osd_q_len].dur = dur;
+        g_osd_q_len++;
+    }
+}
+
+/* Expose last diagnostic string for main.c status line. */
+const char *mic_nx_last_diag(void)
+{
+    return g_last_diag;
 }
 
 /* =========================================================================
