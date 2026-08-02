@@ -34,6 +34,18 @@ static const AudioRendererConfig k_audren_cfg = {
 // ---------------------------------------------------------------------------
 // Concrete definitions of the opaque types declared in aaudio.h. The core only
 // ever holds these by pointer, so their layout is private to this file.
+//
+// IMPORTANT: The field ORDER in AAudioStreamBuilderStruct must remain stable
+// because usb_singstar_nx.c casts a builder pointer to BuilderPeek to read the
+// direction field.  The layout here is:
+//   int32_t sample_rate;      // offset  0
+//   int32_t channel_count;    // offset  4
+//   int32_t device_id;        // offset  8
+//   aaudio_format_t format;   // offset 12
+//   aaudio_direction_t direction; // offset 16  <-- read by usb_singstar_nx.c
+//   aaudio_sharing_mode_t sharing;   // offset 20
+//   aaudio_performance_mode_t perf;  // offset 24
+// Do not reorder these fields without updating BuilderPeek in usb_singstar_nx.c.
 // ---------------------------------------------------------------------------
 struct AAudioStreamBuilderStruct {
   int32_t sample_rate, channel_count, device_id;
@@ -277,9 +289,39 @@ fail_pool:
   return AAUDIO_ERROR_UNAVAILABLE;
 }
 
+// ---------------------------------------------------------------------------
+// INPUT stream hook -- provided by usb_singstar_nx.c
+//
+// When the emulator core requests an AAUDIO_DIRECTION_INPUT stream (to read
+// microphone PCM for the SingStar USB device), we forward to this hook instead
+// of trying to open audren in input mode (which libnx does not support).
+//
+// The hook is declared __attribute__((weak)) so builds without
+// usb_singstar_nx.c still link cleanly; in that case INPUT streams simply
+// return AAUDIO_ERROR_UNAVAILABLE, which is the same behaviour as before.
+// ---------------------------------------------------------------------------
+__attribute__((weak))
+aaudio_result_t usb_singstar_openStream_hook(AAudioStreamBuilder *b,
+                                             AAudioStream **out)
+{
+  (void)b; (void)out;
+  return AAUDIO_ERROR_UNAVAILABLE;
+}
+
 aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder *b,
                                                AAudioStream **stream) {
   if (!b || !stream) return AAUDIO_ERROR_NULL;
+
+  // --- SingStar / USB microphone INPUT path ---
+  // Delegate INPUT streams to usb_singstar_nx.c which owns a fake AAudioStream
+  // backed by real USB UAC capture.  No data_cb check here: the USBMic plugin
+  // in the core may open an INPUT stream without a data callback (it calls
+  // AudioDevice::GetBuffer() directly instead).
+  if (b->direction == AAUDIO_DIRECTION_INPUT) {
+    return usb_singstar_openStream_hook(b, stream);
+  }
+
+  // --- Normal OUTPUT path (unchanged from original) ---
   if (!b->data_cb) {
     // AAudioMod always sets a data callback; without it we have no source.
 
@@ -429,8 +471,27 @@ static int stop_playback_thread(AAudioStream *s) {
 // stream control
 // ---------------------------------------------------------------------------
 
+// Forward declarations for INPUT stream lifecycle hooks (usb_singstar_nx.c).
+// All are weak so builds without that file link cleanly.
+__attribute__((weak)) aaudio_result_t usb_singstar_requestStart_hook(AAudioStream *s)
+  { (void)s; return AAUDIO_ERROR_INVALID_HANDLE; }
+__attribute__((weak)) aaudio_result_t usb_singstar_requestStop_hook(AAudioStream *s)
+  { (void)s; return AAUDIO_ERROR_INVALID_HANDLE; }
+__attribute__((weak)) aaudio_result_t usb_singstar_close_hook(AAudioStream *s)
+  { (void)s; return AAUDIO_ERROR_INVALID_HANDLE; }
+__attribute__((weak)) int64_t usb_singstar_getFramesRead_hook(AAudioStream *s)
+  { (void)s; return -1; }
+
+// usb_singstar_nx.c sets this to 1 for streams it owns (INPUT direction).
+// Returns 0 for all normal OUTPUT streams.
+__attribute__((weak)) int usb_singstar_owns_stream(AAudioStream *s)
+  { (void)s; return 0; }
+
 aaudio_result_t AAudioStream_requestStart(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
+  if (usb_singstar_owns_stream(s))
+    return usb_singstar_requestStart_hook(s);
+
   mutexLock(&s->control_lock);
   if (__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE)) {
     mutexUnlock(&s->control_lock);
@@ -494,6 +555,10 @@ aaudio_result_t AAudioStream_requestStart(AAudioStream *s) {
 
 aaudio_result_t AAudioStream_requestPause(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
+  // INPUT streams don't support pause; treat as stop.
+  if (usb_singstar_owns_stream(s))
+    return AAUDIO_OK;
+
   mutexLock(&s->control_lock);
   if (__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE)) {
     mutexUnlock(&s->control_lock);
@@ -515,6 +580,9 @@ aaudio_result_t AAudioStream_requestPause(AAudioStream *s) {
 
 aaudio_result_t AAudioStream_requestStop(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
+  if (usb_singstar_owns_stream(s))
+    return usb_singstar_requestStop_hook(s);
+
   mutexLock(&s->control_lock);
   if (__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE)) {
     mutexUnlock(&s->control_lock);
@@ -536,6 +604,9 @@ aaudio_result_t AAudioStream_requestStop(AAudioStream *s) {
 
 aaudio_result_t AAudioStream_close(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
+  if (usb_singstar_owns_stream(s))
+    return usb_singstar_close_hook(s);
+
   mutexLock(&s->control_lock);
   if (__atomic_exchange_n(&s->closing, 1, __ATOMIC_ACQ_REL)) {
     mutexUnlock(&s->control_lock);
@@ -578,9 +649,15 @@ aaudio_result_t AAudioStream_close(AAudioStream *s) {
 }
 
 int64_t AAudioStream_getFramesRead(AAudioStream *s) {
+  if (!s) return 0;
+  // For INPUT streams owned by the SingStar layer, delegate to its counter.
+  {
+    int64_t n = usb_singstar_getFramesRead_hook(s);
+    if (n >= 0) return n;
+  }
   // monotonic counter the core uses for A/V sync and its disconnect/
   // "counter mismatch" reopen check; MUST advance while playing.
-  return s ? s->frames_read : 0;
+  return s->frames_read;
 }
 
 aaudio_result_t AAudioStream_waitForStateChange(AAudioStream *s,
@@ -588,6 +665,12 @@ aaudio_result_t AAudioStream_waitForStateChange(AAudioStream *s,
                                                 aaudio_stream_state_t *nextState,
                                                 int64_t timeoutNanoseconds) {
   if (!s) return AAUDIO_ERROR_NULL;
+  // INPUT streams managed by usb_singstar_nx don't have a real state machine;
+  // report STARTED immediately so the core doesn't spin-wait.
+  if (usb_singstar_owns_stream(s)) {
+    if (nextState) *nextState = AAUDIO_STREAM_STATE_STARTED;
+    return AAUDIO_OK;
+  }
 
   mutexLock(&s->lock);
   if (s->state != inputState) {
