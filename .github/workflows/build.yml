@@ -59,8 +59,10 @@ jobs:
           make -j$(nproc)
 
       # ── GL renderer (always built) ─────────────────────────────────────────
+      # TARGET is passed explicitly because the default is $(notdir $(CURDIR)),
+      # which equals the repository/directory name and varies across forks.
       - name: Build GL
-        run: make -j$(nproc) RENDERER=GL
+        run: make -j$(nproc) RENDERER=GL TARGET=NetherSX2_nx
 
       - name: Save GL NRO
         run: cp NetherSX2_nx.nro NetherSX2_nx_gl.nro
@@ -103,7 +105,7 @@ jobs:
         if: steps.vk_check.outputs.available == 'true'
         run: |
           make clean
-          make -j$(nproc) RENDERER=VK
+          make -j$(nproc) RENDERER=VK TARGET=NetherSX2_nx
 
       - name: Save VK NRO
         if: steps.vk_check.outputs.available == 'true'
