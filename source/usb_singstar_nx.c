@@ -1,17 +1,17 @@
-/* usb_singstar_nx.c — Emulated SingStar USB-mic device for NetherSX2
+/* usb_singstar_nx.c - Emulated SingStar USB-mic device for NetherSX2
  *
  * How the PS2 USB mic stack works (abridged)
- * ────────────────────────────────────────────
+ * --------------------------------------------
  * The PS2 USB IOP module enumerates the SingStar adapter, then reads PCM via
  * isochronous IN transfers.  AetherSX2/PCSX2 emulates this in the USBMic
  * plugin (pcsx2/USB/usb-mic/usb-mic.cpp).
  *
  * Critical path in the core:
  *   MicrophoneDevice::CreateDevice()
- *     → AudioDevice::CreateDevice(AUDIODIR_SOURCE, …, playerN_device_name)
- *     → if BOTH players fail to open → device creation FAILS entirely
+ *     -> AudioDevice::CreateDevice(AUDIODIR_SOURCE, ..., playerN_device_name)
+ *     -> if BOTH players fail to open -> device creation FAILS entirely
  *       (OSD: "USB-Mic: Neither player 1 nor 2 is connected")
- *       → game sees no USB mic at all.
+ *       -> game sees no USB mic at all.
  *
  * On Android, AudioDevice is backed by AAudio DIRECTION_INPUT.  On Switch we
  * have no native AAudio input, so we:
@@ -24,7 +24,7 @@
  *  c) Drive PCM either via the data callback (if the core registered one)
  *     or via AAudioStream_read (if the core pulls).
  *
- * MIT License — see LICENSE in the repository root.
+ * MIT License - see LICENSE in the repository root.
  */
 
 #include <switch.h>
@@ -39,6 +39,13 @@
 #include "aaudio.h"
 #include "prefs.h"
 
+/* Diagnostics: how many times core opened INPUT */
+static int g_open_count = 0;
+static int g_start_count = 0;
+int usb_singstar_open_count(void) { return g_open_count; }
+int usb_singstar_start_count(void) { return g_start_count; }
+
+
 /* =========================================================================
  * Fake AAudioStream for INPUT direction
  * ========================================================================= */
@@ -47,7 +54,7 @@
 
 typedef struct {
     AAudioStream *stream;        /* the fake handle returned to the core    */
-    int           player;        /* 0 or 1 → which mic ring buffer to drain */
+    int           player;        /* 0 or 1 -> which mic ring buffer to drain */
     AAudioStream_dataCallback  data_cb;
     void                      *data_user;
     int32_t       frames_per_cb;
@@ -112,7 +119,7 @@ static void *input_capture_thread(void *arg)
             /* Wait roughly half a callback period. */
             int64_t wait_ns = (int64_t)nframes * 1000000000LL
                               / (e->sample_rate > 0 ? e->sample_rate : 48000) / 2;
-            if (wait_ns < 500000) wait_ns = 500000;  /* ≥ 0.5 ms */
+            if (wait_ns < 500000) wait_ns = 500000;  /* >= 0.5 ms */
             svcSleepThread(wait_ns);
             continue;
         }
@@ -124,13 +131,13 @@ static void *input_capture_thread(void *arg)
             memset(tmp + got, 0, (size_t)(need - got) * sizeof(int16_t));
 
         if (e->format == AAUDIO_FORMAT_PCM_FLOAT) {
-            /* Convert i16 → float in-place from the end to avoid clobber. */
+            /* Convert i16 -> float in-place from the end to avoid clobber. */
             float *fbuf = (float *)buf;
             for (int32_t i = (int32_t)need - 1; i >= 0; i--)
                 fbuf[i] = (float)tmp[i] / 32768.0f;
 
             if (e->channel_count >= 2) {
-                /* Duplicate mono → stereo (interleaved). */
+                /* Duplicate mono -> stereo (interleaved). */
                 for (int32_t i = (int32_t)need - 1; i >= 0; i--) {
                     float s = fbuf[i];
                     fbuf[i * 2]     = s;
@@ -163,7 +170,7 @@ static void *input_capture_thread(void *arg)
 }
 
 /* =========================================================================
- * Hooked AAudio entry points — called from aaudio.c
+ * Hooked AAudio entry points - called from aaudio.c
  * ========================================================================= */
 
 /*
@@ -220,7 +227,7 @@ aaudio_result_t usb_singstar_openStream_hook(AAudioStreamBuilder *b,
     }
     e->stream->_singstar_marker = SINGSTAR_MARKER;
 
-    /* Player assignment: first INPUT stream → player 0, second → player 1. */
+    /* Player assignment: first INPUT stream -> player 0, second -> player 1. */
     e->player = 0;
     for (int i = 0; i < g_input_count; i++) {
         if (g_input[i].stream && g_input[i].player >= e->player)
@@ -245,6 +252,7 @@ aaudio_result_t usb_singstar_openStream_hook(AAudioStreamBuilder *b,
     mutexUnlock(&g_input_lock);
 
     *out = e->stream;
+    g_open_count++;
     return AAUDIO_OK;
 }
 
@@ -267,6 +275,7 @@ aaudio_result_t usb_singstar_requestStart_hook(AAudioStream *s)
          * Pull-mode (GetBuffer / AAudioStream_read) does not need it. */
         if (e->data_cb)
             pthread_create(&e->thread, NULL, input_capture_thread, e);
+        g_start_count++;
     }
     mutexUnlock(&g_input_lock);
     return AAUDIO_OK;
@@ -420,7 +429,7 @@ static void inject_singstar_prefs(void)
     /*
      * Force (not merely seed) the SingStar device on Port 1.
      * AetherSX2 / PCSX2 keys:
-     *   USB1/Type_str  or  USB/Port1/Type  — depending on core vintage.
+     *   USB1/Type_str  or  USB/Port1/Type  - depending on core vintage.
      * We write both families so either naming scheme works.
      *
      * Type value "singstar" matches MicrophoneDevice::TypeName().
@@ -428,26 +437,33 @@ static void inject_singstar_prefs(void)
      *
      * Device names must be non-empty so CreateDevice() is actually called.
      * Our AAudio INPUT hook succeeds for any name, so the string is only a
-     * label — it does not need to match a real Android AudioManager device.
+     * label - it does not need to match a real Android AudioManager device.
      */
+    /* Exact PCSX2/AetherSX2 keys (section USB1, TypeName "singstar"):
+     *   USB1/Type = singstar
+     *   USB1/singstar_subtype = 0   (MIC_SINGSTAR dual-mic)
+     *   USB1/singstar_player1_device_name = ...
+     *   USB1/singstar_player2_device_name = ...
+     * FORCE overwrite (prefs_set_*), not seed -- user ini may have Type=None.
+     */
+    prefs_set_string("USB1/Type", "singstar");
+    prefs_set_string("USB1/DeviceType", "singstar");
+    prefs_set_string("USB1/Device", "singstar");
+    prefs_set_string("USB1/singstar_subtype", "0");
+    prefs_set_string("USB1/singstar_player1_device_name", "switch_usb_mic_0");
+    prefs_set_string("USB1/singstar_player2_device_name", "switch_usb_mic_1");
+    prefs_set_string("USB1/singstar_input_latency", "20");
+    prefs_set_string("USB1/singstar_input_device_name", "switch_usb_mic_0");
+
+    /* Older / alternate layouts */
     prefs_set_string("USB/Port1/Type", "singstar");
     prefs_set_string("USB/Port1/singstar/player1_device_name", "switch_usb_mic_0");
     prefs_set_string("USB/Port1/singstar/player2_device_name", "switch_usb_mic_1");
     prefs_set_string("USB/Port1/singstar/input_latency", "20");
+    prefs_set_string("USB/USB1/Type", "singstar");
+    prefs_set_string("USB/USB1/Device", "singstar");
 
-    /* Alternate key scheme used by some AetherSX2 / newer PCSX2 builds
-     * (section "USB1" instead of "USB/Port1"). */
-    prefs_set_string("USB1/Type", "singstar");
-    prefs_set_string("USB1/DeviceType", "singstar");
-    prefs_set_string("USB1/singstar_player1_device_name", "switch_usb_mic_0");
-    prefs_set_string("USB1/singstar_player2_device_name", "switch_usb_mic_1");
-    prefs_set_string("USB1/Device", "singstar");
-
-    /* Newer PCSX2 uses USB1/DeviceType as an integer enum index.
-     * Microphone / singstar is typically a non-zero type id; writing the
-     * string form above is enough for AetherSX2 SharedPreferences path. */
-
-    /* Seed Port2 empty so nothing conflicts. */
+    prefs_set_string("USB2/Type", "None");
     prefs_seed_public("USB/Port2/Type", "none");
 }
 
