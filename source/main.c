@@ -31,6 +31,7 @@
 #include "keycodes.h"
 #include "syslang.h"
 #include "SwitchStorageBridge.h"
+#include "usb_singstar_nx.h"
 #include "CheatManager.h"
 #include "ra_http.h"
 #ifdef USE_VULKAN
@@ -1189,7 +1190,7 @@ static void quick_menu_close(void) {
   g_quick_menu_mode = QUICK_MENU_CLOSED;
   if (g_quick_menu_restore_messages) {
     prefs_set_bool("EmuCore/GS/OsdShowMessages", false);
-    prefs_save();
+  prefs_save();
     nl.applySettings(fake_env, NATIVE_CLASS);
     g_quick_menu_restore_messages = 0;
   }
@@ -1827,6 +1828,14 @@ int main(void) {
   snprintf(g_core_so, sizeof(g_core_so), "%s",
            prefs_get_string("Wrapper/CoreSo", SO_NAME));
 
+  /* SingStar USB microphone support.
+   * Must run after prefs_init() (so our prefs_seed_public calls see the
+   * already-loaded user ini) and before the emulator core starts (so the
+   * USB/Port1/Type key is in place when the core reads its settings).
+   * Returns 0 if a physical mic was found, 1 if not -- either way the
+   * emulated SingStar device is registered on PS2 USB Port 1. */
+  usb_singstar_nx_init();
+
   check_syscalls();
   check_data(g_core_so, g_disc_path);
   if (!memory_smc_initialize())
@@ -1957,6 +1966,7 @@ int main(void) {
   pthr_shutdown();
   libc_memory_shutdown();
   so_unload(&emu_mod);
+  usb_singstar_nx_exit();
   prefs_save();
   const bool storage_socket = switchStorageSocketReady();
   switchStorageShutdown();
