@@ -41,4 +41,9 @@ void prefs_remove    (const char *key);
 // override the boot disc path (the launcher's EmuCore/DiscPath) before seeding
 void prefs_set_disc_path(const char *path);
 
+// prefs_seed_public -- like the internal prefs_seed() but callable from other
+// modules (e.g. usb_singstar_nx.c).  Only writes the key if not already present
+// in the ini (i.e. never clobbers a user's explicit choice).
+void prefs_seed_public(const char *key, const char *val);
+
 #endif
