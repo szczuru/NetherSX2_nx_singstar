@@ -1,0 +1,188 @@
+name: Build NetherSX2 (SingStar USB mic)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      renderer:
+        description: 'Renderer (GL or VK)'
+        required: false
+        default: 'GL'
+        type: choice
+        options: [ GL, VK ]
+      release:
+        description: 'Create a release'
+        required: false
+        default: false
+        type: boolean
+
+# Abort in-progress runs on the same branch when a newer push arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build job — runs on ubuntu-latest using the official devkitPro Docker image
+  # so we get devkitA64, libnx, switch-mesa and portlibs out of the box.
+  # ─────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.renderer }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: ${{ fromJson(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.renderer) || '["GL","VK"]') }}
+
+    container:
+      image: devkitpro/devkita64:latest
+      # devkitPro images ship with DEVKITPRO=/opt/devkitpro already set;
+      # the container env is inherited by all steps.
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0        # full history so APP_VERSION git-describe works
+
+      # ── 2. Install devkitPro packages needed for the build ─────────────────
+      # switch-mesa  → EGL/GLESv2/glapi/drm_nouveau (GL renderer)
+      # switch-mesa-mesa-vulkan-drivers → not needed here (NVK is vendored)
+      # devkitpro-pkgbuild-helpers / dkp-pacman already available in image.
+      - name: Install devkitPro packages
+        run: |
+          dkp-pacman -Sy --noconfirm \
+            switch-dev \
+            switch-mesa \
+            switch-curl \
+            switch-zlib \
+            switch-libdrm_nouveau \
+            switch-mbedtls \
+            || true   # mesa/curl may already be present in the image
+
+      # ── 3. Build cmake dependencies (libsmb2 + libusbhsfs) ────────────────
+      # The repo pre-seeds these under launcher/dependencies/.  If the build/
+      # directory already has the .a archives (e.g. from a cache hit below)
+      # we skip this step to save time.
+      - name: Cache cmake dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: launcher/dependencies/build
+          key: deps-${{ runner.os }}-${{ hashFiles('launcher/dependencies/CMakeLists.txt', 'launcher/dependencies/**/*.cmake') }}
+
+      - name: Build cmake dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p launcher/dependencies/build
+          cd launcher/dependencies/build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G "Unix Makefiles"
+          make -j$(nproc)
+
+      # ── 4. Build NetherSX2 ─────────────────────────────────────────────────
+      - name: Build (RENDERER=${{ matrix.renderer }})
+        run: |
+          make -j$(nproc) RENDERER=${{ matrix.renderer }}
+
+      # ── 5. Rename artifact to include renderer and short SHA ───────────────
+      - name: Rename output
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          SUFFIX="${{ matrix.renderer }}-${SHORT_SHA}"
+          mv NetherSX2_nx.nro NetherSX2_nx-${SUFFIX}.nro
+          echo "ARTIFACT_NAME=NetherSX2_nx-${SUFFIX}" >> $GITHUB_ENV
+          echo "NRO_FILE=NetherSX2_nx-${SUFFIX}.nro"  >> $GITHUB_ENV
+
+      # ── 6. Upload .nro as workflow artifact ────────────────────────────────
+      - name: Upload NRO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.NRO_FILE }}
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Release job — only runs on push to main/master OR when workflow_dispatch
+  # has release=true.  Waits for both renderer builds to succeed.
+  # ─────────────────────────────────────────────────────────────────────────
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
+      || (github.event_name == 'workflow_dispatch' && inputs.release == true)
+
+    permissions:
+      contents: write   # needed to create releases and upload assets
+
+    steps:
+      - name: Checkout (for tag info)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Download all artifacts produced by the build matrix
+      - name: Download all NRO artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true    # flatten into dist/ instead of per-name dirs
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      # Derive a version string: prefer a git tag, fall back to short SHA
+      - name: Compute version tag
+        id: version
+        run: |
+          TAG=$(git describe --tags --exact-match 2>/dev/null || true)
+          if [ -z "$TAG" ]; then
+            TAG="nightly-${GITHUB_SHA::7}"
+          fi
+          echo "tag=$TAG"          >> $GITHUB_OUTPUT
+          echo "prerelease=$([[ "$TAG" == nightly-* ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "NetherSX2 ${{ steps.version.outputs.tag }} (SingStar USB mic)"
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            ## NetherSX2 with SingStar USB microphone support
+
+            Built from commit `${{ github.sha }}`.
+
+            ### Included builds
+            | File | Renderer |
+            |------|----------|
+            | `*-GL-*.nro` | OpenGL (switch-mesa GLES) |
+            | `*-VK-*.nro` | Vulkan (Mesa NVK, vendored) |
+
+            ### SingStar mic setup
+            1. Podłącz adapter SingStar (VID `0x1415`) do portu USB-A w docku (lub przez aktywny hub OTG do USB-C).
+            2. Uruchom emulator — mikrofon pojawi się automatycznie na PS2 USB Port 1.
+            3. Opcjonalna konfiguracja w `nethersx2.ini`:
+               ```ini
+               USB/Port1/Type = singstar
+               USB/Port1/singstar/player1_volume = 240
+               USB/Port1/singstar/player2_volume = 240
+               ```
+          files: dist/*.nro
