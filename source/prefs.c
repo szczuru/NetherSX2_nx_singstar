@@ -83,6 +83,15 @@ static void prefs_seed(const char *key, const char *val) {
     prefs_put(key, val);
 }
 
+// prefs_seed_public -- public wrapper around the internal prefs_seed().
+// Callable from other modules (e.g. usb_singstar_nx.c) to inject USB device
+// settings before the emulator core reads them.  Like prefs_seed(), this only
+// writes a key when it is absent, so an explicit user setting in nethersx2.ini
+// is always preserved.
+void prefs_seed_public(const char *key, const char *val) {
+  prefs_seed(key, val);
+}
+
 // ---------------------------------------------------------------------------
 // ini parsing
 // ---------------------------------------------------------------------------
