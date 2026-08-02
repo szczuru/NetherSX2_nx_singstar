@@ -408,21 +408,46 @@ static void release_player(MicPlayer *p)
     ring_init(&p->ring);
 }
 
+static int g_last_fail_step = 0; /* 1=alloc 2=acquire 3=ep 4=thread */
+static Result g_last_fail_rc = 0;
+
 static int start_player_from_iface(MicPlayer *p, UsbHsInterface *iface)
 {
     if (p->active) return MIC_NX_OK;
+    g_last_fail_step = 0;
+    g_last_fail_rc = 0;
 
     if (!p->xfer_buf) {
         p->xfer_buf = (uint8_t *)aligned_alloc(0x1000, ISO_XFER_SIZE);
-        if (!p->xfer_buf) return MIC_NX_ERR_INIT;
+        if (!p->xfer_buf) { g_last_fail_step = 1; return MIC_NX_ERR_INIT; }
         memset(p->xfer_buf, 0, ISO_XFER_SIZE);
     }
 
-    if (open_audio_interface(&p->iface, iface) != 0)
+    Result rc = usbHsAcquireUsbIf(&p->iface, iface);
+    if (R_FAILED(rc)) {
+        g_last_fail_step = 2;
+        g_last_fail_rc = rc;
         return MIC_NX_ERR_INIT;
+    }
     p->iface_open = 1;
 
-    if (open_iso_ep(&p->ep, &p->iface) != 0) {
+    /* Try alt settings 1, 2, then 0 - SingStar streaming is usually alt 1 or 2 */
+    int ep_ok = 0;
+    for (u8 alt = 1; alt <= 2 && !ep_ok; alt++) {
+        usbHsIfSetInterface(&p->iface, NULL, alt);
+        /* Refresh local interface info after SetInterface */
+        usbHsIfGetInterface(&p->iface, NULL);
+        if (open_iso_ep(&p->ep, &p->iface) == 0)
+            ep_ok = 1;
+    }
+    if (!ep_ok) {
+        usbHsIfSetInterface(&p->iface, NULL, 0);
+        usbHsIfGetInterface(&p->iface, NULL);
+        if (open_iso_ep(&p->ep, &p->iface) == 0)
+            ep_ok = 1;
+    }
+    if (!ep_ok) {
+        g_last_fail_step = 3;
         usbHsIfClose(&p->iface);
         p->iface_open = 0;
         return MIC_NX_ERR_INIT;
@@ -435,6 +460,7 @@ static int start_player_from_iface(MicPlayer *p, UsbHsInterface *iface)
 
     p->stop_flag = 0;
     if (pthread_create(&p->thread, NULL, capture_thread, p) != 0) {
+        g_last_fail_step = 4;
         release_player(p);
         return MIC_NX_ERR_INIT;
     }
@@ -449,14 +475,24 @@ static int try_probe_all(void)
     Result qrc = 0;
     s32 total = query_audio_interfaces(ifaces, MAX_IFACES, &qrc);
 
-    snprintf(g_last_diag, sizeof(g_last_diag),
-             "USB q:rc=0x%08X n=%d", (unsigned)qrc, (int)total);
-
-    if (total <= 0)
+    if (total <= 0) {
+        snprintf(g_last_diag, sizeof(g_last_diag),
+                 "USB q:rc=0x%08X n=%d", (unsigned)qrc, (int)total);
         return 0;
+    }
+
+    /* Describe first interface for diagnostics */
+    u8 cls0 = ifaces[0].inf.interface_desc.bInterfaceClass;
+    u8 sub0 = ifaces[0].inf.interface_desc.bInterfaceSubClass;
+    u8 numep = ifaces[0].inf.interface_desc.bNumEndpoints;
+    u16 vid0 = ifaces[0].device_desc.idVendor;
+    u16 pid0 = ifaces[0].device_desc.idProduct;
 
     int started = 0;
-    /* Prefer AudioStreaming (subclass 0x02) interfaces; fall back to any. */
+    int attempts = 0;
+    int last_fail = 0;
+
+    /* Pass 0: AudioStreaming only; pass 1: any Audio */
     for (int pass = 0; pass < 2; pass++) {
         for (s32 i = 0; i < total; i++) {
             u8 sub = ifaces[i].inf.interface_desc.bInterfaceSubClass;
@@ -466,9 +502,9 @@ static int try_probe_all(void)
             if (pass == 1 && cls != 0x01)
                 continue;
 
-            /* Assign to first free player slot */
             for (int p = 0; p < MIC_NX_PLAYERS; p++) {
                 if (g_players[p].active) continue;
+                attempts++;
                 if (start_player_from_iface(&g_players[p], &ifaces[i]) == MIC_NX_OK) {
                     started++;
                     char msg[96];
@@ -477,12 +513,25 @@ static int try_probe_all(void)
                              p + 1, g_players[p].last_name,
                              g_players[p].last_vid, g_players[p].last_pid);
                     osd("usb_mic_conn", msg, 5.0f);
+                } else {
+                    last_fail = g_last_fail_step;
                 }
                 break;
             }
-            if (started >= MIC_NX_PLAYERS) return started;
+            if (started >= MIC_NX_PLAYERS) break;
         }
-        if (started > 0) return started;
+        if (started > 0) break;
+    }
+
+    if (started == 0) {
+        /* fail step: 1=alloc 2=acquire 3=endpoint 4=thread */
+        snprintf(g_last_diag, sizeof(g_last_diag),
+                 "n=%d %04X:%04X cls=%02X/%02X ep=%u fail=%d rc=0x%X",
+                 (int)total, vid0, pid0, cls0, sub0, (unsigned)numep,
+                 last_fail, (unsigned)g_last_fail_rc);
+    } else {
+        snprintf(g_last_diag, sizeof(g_last_diag),
+                 "ok n=%d started=%d", (int)total, started);
     }
     return started;
 }
