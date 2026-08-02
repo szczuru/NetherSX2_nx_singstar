@@ -1942,14 +1942,16 @@ int main(void) {
         quick_menu_status("Quick menu: L + R + Plus");
         quick_menu_hint_shown = 1;
 
-        /* Late-bind OSD + report mic status once the core can display it. */
         mic_nx_set_osd_callback(mic_osd_bridge);
+
         if (usb_singstar_nx_connected())
           quick_menu_status("USB Mic: connected");
-        else
-          quick_menu_status("USB Mic: none (plug into dock USB-A)");
+        else {
+          char line[192];
+          snprintf(line, sizeof(line), "USB Mic: none [%s]", mic_nx_last_diag());
+          quick_menu_status(line);
+        }
       }
-    }
 
     update_gamepads();
     ++input_polls;
