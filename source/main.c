@@ -1952,6 +1952,7 @@ int main(void) {
           quick_menu_status(line);
         }
       }
+    }
 
     update_gamepads();
     ++input_polls;
@@ -1997,5 +1998,4 @@ int main(void) {
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
   return 0;
-}
 }
