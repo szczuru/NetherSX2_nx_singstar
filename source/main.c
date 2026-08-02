@@ -1944,11 +1944,14 @@ int main(void) {
 
         mic_nx_set_osd_callback(mic_osd_bridge);
 
-        if (usb_singstar_nx_connected())
-          quick_menu_status("USB Mic: connected");
-        else {
+        {
           char line[192];
-          snprintf(line, sizeof(line), "USB Mic: none [%s]", mic_nx_last_diag());
+          snprintf(line, sizeof(line),
+                   "Mic: phys=%d aaudio_open=%d start=%d [%s]",
+                   usb_singstar_nx_connected(),
+                   usb_singstar_open_count(),
+                   usb_singstar_start_count(),
+                   mic_nx_last_diag());
           quick_menu_status(line);
         }
       }
