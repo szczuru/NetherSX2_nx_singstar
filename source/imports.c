@@ -224,6 +224,7 @@ DynLibFunction dynlib_functions[] = {
   { "AAudioStreamBuilder_setSharingMode", (uintptr_t)&AAudioStreamBuilder_setSharingMode },
   { "AAudioStream_close", (uintptr_t)&AAudioStream_close },
   { "AAudioStream_getFramesRead", (uintptr_t)&AAudioStream_getFramesRead },
+  { "AAudioStream_read", (uintptr_t)&AAudioStream_read },
   { "AAudioStream_requestPause", (uintptr_t)&AAudioStream_requestPause },
   { "AAudioStream_requestStart", (uintptr_t)&AAudioStream_requestStart },
   { "AAudioStream_requestStop", (uintptr_t)&AAudioStream_requestStop },
