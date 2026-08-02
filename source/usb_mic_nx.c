@@ -1,37 +1,15 @@
-/* usb_mic_nx.c — UAC host driver for SingStar microphones on Nintendo Switch
+/* usb_mic_nx.c - UAC host driver for SingStar microphones on Nintendo Switch
  *
- * Architecture overview
- * ─────────────────────
- * The Switch USB stack (libnx UsbHs) can act as a USB host through the dock's
- * USB-A ports.  A SingStar mic adapter presents itself as a USB Audio Class
- * (UAC 1.0) device with isochronous IN endpoints — one per microphone capsule.
+ * Uses libnx UsbHs (usb:hs) as USB host via the dock USB-A ports.
+ * Enumerates UAC AudioStreaming interfaces, opens isochronous IN endpoints,
+ * and feeds a lock-free ring buffer consumed by usb_singstar_nx.c.
  *
- * This module:
- *  1. Waits (non-blocking) for a device matching known SingStar VID/PIDs
- *     (or any UAC AudioStreaming interface).
- *  2. Opens the AudioStreaming interface, selects alternate setting 1,
- *     and opens the isochronous IN endpoint.
- *  3. Runs a capture thread per player that submits usbHsEpPostBuffer()
- *     synchronous transfers and writes the received PCM into a lock-free
- *     power-of-2 ring buffer.
- *  4. Exposes mic_nx_read() / mic_nx_frames_available() for the PS2 USB
- *     gadget layer (usb_singstar_nx.c).
- *  5. Runs a lightweight hotplug thread so mics plugged in after boot are
- *     picked up without restarting the emulator.
+ * IMPORTANT: We call usbHsInitialize() ourselves and register an
+ * InterfaceAvailableEvent. Relying solely on libusbhsfs is not enough -
+ * its filter is MASS_STORAGE only, and without our own available-event the
+ * host stack may not surface Audio interfaces to QueryAvailableInterfaces.
  *
- * usbHs ownership
- * ───────────────
- * We do NOT call usbHsInitialize() / usbHsExit().  libusbhsfs (used by
- * SwitchStorage for mass-storage devices) already owns that lifecycle via
- * usbHsFsInitialize().  Our filter targets bInterfaceClass=0x01 (Audio),
- * which is entirely disjoint from libusbhsfs's MASS_STORAGE filter, so
- * the two subsystems never contend for the same interface.
- *
- * mic_nx_init() MUST therefore be called after switchStorageInitializeForPath()
- * (which triggers usbHsFsInitialize).  The call site in main.c already
- * guarantees this ordering.
- *
- * MIT License — see LICENSE in the repository root.
+ * MIT License - see LICENSE in the repository root.
  */
 
 #define _GNU_SOURCE
@@ -46,10 +24,10 @@
 #include "usb_mic_nx.h"
 
 /* =========================================================================
- * Ring buffer — lock-free single-producer / single-consumer
+ * Ring buffer - lock-free SPSC
  * ========================================================================= */
 
-#define RING_CAP  MIC_NX_RING_FRAMES          /* must be power of 2        */
+#define RING_CAP  MIC_NX_RING_FRAMES
 #define RING_MASK (RING_CAP - 1)
 
 typedef struct {
@@ -101,14 +79,9 @@ static uint32_t ring_read(MicRing *r, int16_t *dst, uint32_t frames)
 }
 
 /* =========================================================================
- * Per-player capture state
+ * Per-player state
  * ========================================================================= */
 
-/*
- * Maximum transfer size for a 48 kHz mono 16-bit mic at 1 ms/frame:
- *   48 samples * 2 bytes = 96 bytes.  Round up to page size (0x1000).
- * usbHsEpPostBuffer requires the buffer address AND size to be 0x1000-aligned.
- */
 #define ISO_XFER_SIZE  0x1000u
 
 typedef struct {
@@ -122,7 +95,7 @@ typedef struct {
     volatile int            stop_flag;
     MicRing                 ring;
     uint8_t                 vol;
-    uint8_t                *xfer_buf;   /* ISO_XFER_SIZE, 0x1000-aligned */
+    uint8_t                *xfer_buf;
     uint16_t                last_vid;
     uint16_t                last_pid;
     char                    last_name[32];
@@ -137,7 +110,13 @@ static pthread_t  g_hotplug_thread;
 static volatile int g_hotplug_stop = 0;
 static int        g_hotplug_running = 0;
 
+static int        g_usbhs_inited_by_us = 0;
+static Event      g_iface_event;
+static int        g_iface_event_ok = 0;
+static u8         g_iface_event_index = 1; /* 0 often taken by libusbhsfs */
+
 static mic_nx_osd_fn g_osd_cb = NULL;
+static char          g_last_diag[128];
 
 void mic_nx_set_osd_callback(mic_nx_osd_fn fn)
 {
@@ -151,11 +130,60 @@ static void osd(const char *key, const char *msg, float dur)
 }
 
 /* =========================================================================
- * USB device matching
+ * UsbHs bring-up
+ * ========================================================================= */
+
+static Result ensure_usbhs(void)
+{
+    /* Safe to call even if libusbhsfs already initialised usb:hs -
+     * libnx returns success when the service is already active. */
+    Result rc = usbHsInitialize();
+    if (R_SUCCEEDED(rc))
+        g_usbhs_inited_by_us = 1;
+    /* If it failed because already inited by someone else, continue. */
+    return 0;
+}
+
+static void setup_available_event(void)
+{
+    if (g_iface_event_ok) return;
+
+    UsbHsInterfaceFilter filter;
+    memset(&filter, 0, sizeof(filter));
+    /* Flags MUST be non-zero on FW 7.0+. Match any Audio class interface. */
+    filter.Flags = (u16)UsbHsInterfaceFilterFlags_bInterfaceClass;
+    filter.bInterfaceClass = 0x01; /* Audio */
+
+    /* Try event index 1, then 2, then 0. */
+    for (u8 idx = 1; idx <= 2; idx++) {
+        Result rc = usbHsCreateInterfaceAvailableEvent(&g_iface_event, true, idx, &filter);
+        if (R_SUCCEEDED(rc)) {
+            g_iface_event_index = idx;
+            g_iface_event_ok = 1;
+            return;
+        }
+    }
+    Result rc = usbHsCreateInterfaceAvailableEvent(&g_iface_event, true, 0, &filter);
+    if (R_SUCCEEDED(rc)) {
+        g_iface_event_index = 0;
+        g_iface_event_ok = 1;
+    }
+}
+
+static void teardown_available_event(void)
+{
+    if (g_iface_event_ok) {
+        usbHsDestroyInterfaceAvailableEvent(&g_iface_event, g_iface_event_index);
+        g_iface_event_ok = 0;
+    }
+}
+
+/* =========================================================================
+ * Device matching
  * ========================================================================= */
 
 typedef struct {
-    uint16_t vid, pid;  /* pid == 0 → match any PID from this VID */
+    uint16_t vid, pid;
     const char *name;
 } KnownDevice;
 
@@ -166,24 +194,20 @@ static const KnownDevice k_known[] = {
 };
 #define NUM_KNOWN (sizeof(k_known) / sizeof(k_known[0]))
 
-static int device_matches(const UsbHsInterface *iface, const char **out_name)
+static const char *device_name_for(const UsbHsInterface *iface)
 {
     uint16_t vid = iface->device_desc.idVendor;
     uint16_t pid = iface->device_desc.idProduct;
     for (size_t i = 0; i < NUM_KNOWN; i++) {
         if (vid == k_known[i].vid &&
-            (k_known[i].pid == 0x0000 || pid == k_known[i].pid)) {
-            if (out_name) *out_name = k_known[i].name;
-            return 1;
-        }
+            (k_known[i].pid == 0x0000 || pid == k_known[i].pid))
+            return k_known[i].name;
     }
-    /* Accept any UAC AudioStreaming interface regardless of VID/PID */
-    if (out_name) *out_name = "UAC mic";
-    return 1;
+    return "UAC";
 }
 
 /* =========================================================================
- * Interface / endpoint helpers
+ * Open helpers
  * ========================================================================= */
 
 static int open_audio_interface(UsbHsClientIfSession *out_iface,
@@ -193,18 +217,11 @@ static int open_audio_interface(UsbHsClientIfSession *out_iface,
     if (R_FAILED(rc))
         return -1;
 
-    /* Select alternate setting 1 (active streaming, non-zero bandwidth).
-     * Some devices only expose alt 1 after the SET_INTERFACE; ignore the
-     * return and try the EP open either way. */
+    /* Try alt-setting 1 (streaming), then 2 (stereo on some SingStar). */
     usbHsIfSetInterface(out_iface, NULL, 1);
-
     return 0;
 }
 
-/*
- * Find the first isochronous IN endpoint and open it.
- * bmAttributes & 0x03 == 0x01 → isochronous.
- */
 static int open_iso_ep(UsbHsClientEpSession *out_ep,
                        UsbHsClientIfSession  *iface)
 {
@@ -212,21 +229,33 @@ static int open_iso_ep(UsbHsClientEpSession *out_ep,
 
     for (int i = 0; i < 15; i++) {
         struct usb_endpoint_descriptor ep_desc = info->input_endpoint_descs[i];
-
         if (ep_desc.bLength == 0) break;
 
         uint8_t type = ep_desc.bmAttributes & 0x03u;
-        if (type == 0x01u) {               /* isochronous */
+        /* 0x01 = isochronous, also accept interrupt (0x03) as fallback */
+        if (type == 0x01u || type == 0x03u) {
             uint32_t mps = ep_desc.wMaxPacketSize;
-            if (mps == 0) mps = ISO_XFER_SIZE;
-            /* Some stacks want the transfer size >= wMaxPacketSize and
-             * still page-aligned.  Keep ISO_XFER_SIZE (0x1000). */
+            if (mps == 0) mps = 192;
+
             Result rc = usbHsIfOpenUsbEp(iface, out_ep, 1, ISO_XFER_SIZE, &ep_desc);
             if (R_SUCCEEDED(rc)) return 0;
-            /* Fallback: try with the descriptor's own MPS */
+
+            rc = usbHsIfOpenUsbEp(iface, out_ep, 1, (mps + 0xFFF) & ~0xFFFu, &ep_desc);
+            if (R_SUCCEEDED(rc)) return 0;
+
             rc = usbHsIfOpenUsbEp(iface, out_ep, 1, mps, &ep_desc);
             if (R_SUCCEEDED(rc)) return 0;
         }
+    }
+
+    /* Last resort: open first non-empty IN endpoint regardless of type */
+    for (int i = 0; i < 15; i++) {
+        struct usb_endpoint_descriptor ep_desc = info->input_endpoint_descs[i];
+        if (ep_desc.bLength == 0) break;
+        uint32_t mps = ep_desc.wMaxPacketSize ? ep_desc.wMaxPacketSize : 64;
+        Result rc = usbHsIfOpenUsbEp(iface, out_ep, 1, ISO_XFER_SIZE, &ep_desc);
+        if (R_SUCCEEDED(rc)) return 0;
+        (void)mps;
     }
     return -1;
 }
@@ -248,20 +277,15 @@ static void *capture_thread(void *arg)
 
     while (!p->stop_flag) {
         uint32_t transferred = 0;
-
-        Result rc = usbHsEpPostBuffer(&p->ep,
-                                      p->xfer_buf,
-                                      ISO_XFER_SIZE,
-                                      &transferred);
+        Result rc = usbHsEpPostBuffer(&p->ep, p->xfer_buf, ISO_XFER_SIZE, &transferred);
 
         if (p->stop_flag) break;
 
         if (R_FAILED(rc) || transferred == 0) {
-            svcSleepThread(1000000ULL);   /* 1 ms back-off */
+            svcSleepThread(2000000ULL); /* 2 ms */
             continue;
         }
 
-        /* Only use whole 16-bit frames; discard a possible trailing byte. */
         uint32_t frames = transferred / MIC_NX_FRAME_BYTES;
         if (frames == 0) continue;
 
@@ -269,15 +293,80 @@ static void *capture_thread(void *arg)
         apply_volume(samples, frames, p->vol);
         ring_write(&p->ring, samples, frames);
     }
-
     return NULL;
 }
 
 /* =========================================================================
- * Device probe / release
+ * Enumerate + probe
  * ========================================================================= */
 
-#define MAX_IFACES 8
+#define MAX_IFACES 16
+
+/* Try several filters and return total interfaces found into `out`. */
+static s32 query_audio_interfaces(UsbHsInterface *out, s32 max_count, Result *out_rc)
+{
+    s32 total = 0;
+    Result rc;
+
+    /* 1) Audio class only (covers control + streaming) */
+    {
+        UsbHsInterfaceFilter f;
+        memset(&f, 0, sizeof(f));
+        f.Flags = (u16)UsbHsInterfaceFilterFlags_bInterfaceClass;
+        f.bInterfaceClass = 0x01;
+        rc = usbHsQueryAvailableInterfaces(&f, out, (size_t)max_count * sizeof(UsbHsInterface), &total);
+        if (out_rc) *out_rc = rc;
+        if (R_SUCCEEDED(rc) && total > 0) return total;
+    }
+
+    /* 2) Audio + AudioStreaming subclass */
+    {
+        UsbHsInterfaceFilter f;
+        memset(&f, 0, sizeof(f));
+        f.Flags = (u16)(UsbHsInterfaceFilterFlags_bInterfaceClass |
+                        UsbHsInterfaceFilterFlags_bInterfaceSubClass);
+        f.bInterfaceClass    = 0x01;
+        f.bInterfaceSubClass = 0x02;
+        total = 0;
+        rc = usbHsQueryAvailableInterfaces(&f, out, (size_t)max_count * sizeof(UsbHsInterface), &total);
+        if (out_rc) *out_rc = rc;
+        if (R_SUCCEEDED(rc) && total > 0) return total;
+    }
+
+    /* 3) Known SingStar VID */
+    {
+        UsbHsInterfaceFilter f;
+        memset(&f, 0, sizeof(f));
+        f.Flags = (u16)UsbHsInterfaceFilterFlags_idVendor;
+        f.idVendor = SINGSTAR_VID;
+        total = 0;
+        rc = usbHsQueryAvailableInterfaces(&f, out, (size_t)max_count * sizeof(UsbHsInterface), &total);
+        if (out_rc) *out_rc = rc;
+        if (R_SUCCEEDED(rc) && total > 0) return total;
+    }
+
+    /* 4) Logitech VID */
+    {
+        UsbHsInterfaceFilter f;
+        memset(&f, 0, sizeof(f));
+        f.Flags = (u16)UsbHsInterfaceFilterFlags_idVendor;
+        f.idVendor = LOGITECH_VID;
+        total = 0;
+        rc = usbHsQueryAvailableInterfaces(&f, out, (size_t)max_count * sizeof(UsbHsInterface), &total);
+        if (out_rc) *out_rc = rc;
+        if (R_SUCCEEDED(rc) && total > 0) return total;
+    }
+
+    /* 5) Any already-acquired interfaces (in case another layer claimed them) */
+    {
+        total = 0;
+        rc = usbHsQueryAcquiredInterfaces(out, (size_t)max_count * sizeof(UsbHsInterface), &total);
+        if (out_rc) *out_rc = rc;
+        if (R_SUCCEEDED(rc) && total > 0) return total;
+    }
+
+    return 0;
+}
 
 static void release_player(MicPlayer *p)
 {
@@ -286,48 +375,22 @@ static void release_player(MicPlayer *p)
         pthread_join(p->thread, NULL);
         p->active = 0;
     }
-    if (p->ep_open) {
-        usbHsEpClose(&p->ep);
-        p->ep_open = 0;
-    }
-    if (p->iface_open) {
-        usbHsIfClose(&p->iface);
-        p->iface_open = 0;
-    }
+    if (p->ep_open)    { usbHsEpClose(&p->ep);    p->ep_open = 0; }
+    if (p->iface_open) { usbHsIfClose(&p->iface); p->iface_open = 0; }
     ring_init(&p->ring);
 }
 
-static int probe_player(MicPlayer *p)
+static int start_player_from_iface(MicPlayer *p, UsbHsInterface *iface)
 {
-    /*
-     * Filter on bInterfaceClass=0x01 (Audio) and bInterfaceSubClass=0x02
-     * (AudioStreaming).  Any UAC mic is accepted.
-     */
-    UsbHsInterfaceFilter filter;
-    memset(&filter, 0, sizeof(filter));
-    filter.Flags = (u16)(UsbHsInterfaceFilterFlags_bInterfaceClass |
-                         UsbHsInterfaceFilterFlags_bInterfaceSubClass);
-    filter.bInterfaceClass    = 0x01;   /* Audio            */
-    filter.bInterfaceSubClass = 0x02;   /* AudioStreaming   */
+    if (p->active) return MIC_NX_OK;
 
-    UsbHsInterface ifaces[MAX_IFACES];
-    memset(ifaces, 0, sizeof(ifaces));
-    s32 total = 0;
+    if (!p->xfer_buf) {
+        p->xfer_buf = (uint8_t *)aligned_alloc(0x1000, ISO_XFER_SIZE);
+        if (!p->xfer_buf) return MIC_NX_ERR_INIT;
+        memset(p->xfer_buf, 0, ISO_XFER_SIZE);
+    }
 
-    Result rc = usbHsQueryAvailableInterfaces(&filter, ifaces,
-                                              sizeof(ifaces), &total);
-    if (R_FAILED(rc) || total <= 0)
-        return MIC_NX_ERR_NODEV;
-
-    /* Player 0 → first interface, Player 1 → second interface.
-     * If only one interface is present, Player 1 stays silent. */
-    if (p->player >= total)
-        return MIC_NX_ERR_NODEV;
-
-    const char *dev_name = NULL;
-    device_matches(&ifaces[p->player], &dev_name);
-
-    if (open_audio_interface(&p->iface, &ifaces[p->player]) != 0)
+    if (open_audio_interface(&p->iface, iface) != 0)
         return MIC_NX_ERR_INIT;
     p->iface_open = 1;
 
@@ -338,68 +401,79 @@ static int probe_player(MicPlayer *p)
     }
     p->ep_open = 1;
 
-    p->last_vid = ifaces[p->player].device_desc.idVendor;
-    p->last_pid = ifaces[p->player].device_desc.idProduct;
-    snprintf(p->last_name, sizeof(p->last_name), "%s",
-             dev_name ? dev_name : "UAC mic");
-
-    return MIC_NX_OK;
-}
-
-static int start_player(MicPlayer *p)
-{
-    if (p->active) return MIC_NX_OK;
-
-    if (!p->xfer_buf) {
-        p->xfer_buf = (uint8_t *)aligned_alloc(0x1000, ISO_XFER_SIZE);
-        if (!p->xfer_buf) return MIC_NX_ERR_INIT;
-        memset(p->xfer_buf, 0, ISO_XFER_SIZE);
-    }
-
-    if (probe_player(p) != MIC_NX_OK)
-        return MIC_NX_ERR_NODEV;
+    p->last_vid = iface->device_desc.idVendor;
+    p->last_pid = iface->device_desc.idProduct;
+    snprintf(p->last_name, sizeof(p->last_name), "%s", device_name_for(iface));
 
     p->stop_flag = 0;
     if (pthread_create(&p->thread, NULL, capture_thread, p) != 0) {
         release_player(p);
         return MIC_NX_ERR_INIT;
     }
-
     p->active = 1;
     return MIC_NX_OK;
 }
 
-/* =========================================================================
- * Hotplug thread — re-probe inactive players every ~1.5 s
- * ========================================================================= */
-
-static void try_hotplug(void)
+static int try_probe_all(void)
 {
-    for (int i = 0; i < MIC_NX_PLAYERS; i++) {
-        MicPlayer *p = &g_players[i];
-        if (p->active) continue;
+    UsbHsInterface ifaces[MAX_IFACES];
+    memset(ifaces, 0, sizeof(ifaces));
+    Result qrc = 0;
+    s32 total = query_audio_interfaces(ifaces, MAX_IFACES, &qrc);
 
-        if (start_player(p) == MIC_NX_OK) {
-            char msg[96];
-            snprintf(msg, sizeof(msg),
-                     "USB Mic P%d connected (%s %04x:%04x)",
-                     i + 1, p->last_name, p->last_vid, p->last_pid);
-            osd("usb_mic_conn", msg, 4.0f);
+    snprintf(g_last_diag, sizeof(g_last_diag),
+             "USB q:rc=0x%08X n=%d", (unsigned)qrc, (int)total);
+
+    if (total <= 0)
+        return 0;
+
+    int started = 0;
+    /* Prefer AudioStreaming (subclass 0x02) interfaces; fall back to any. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (s32 i = 0; i < total; i++) {
+            u8 sub = ifaces[i].inf.interface_desc.bInterfaceSubClass;
+            u8 cls = ifaces[i].inf.interface_desc.bInterfaceClass;
+            if (pass == 0 && !(cls == 0x01 && sub == 0x02))
+                continue;
+            if (pass == 1 && cls != 0x01)
+                continue;
+
+            /* Assign to first free player slot */
+            for (int p = 0; p < MIC_NX_PLAYERS; p++) {
+                if (g_players[p].active) continue;
+                if (start_player_from_iface(&g_players[p], &ifaces[i]) == MIC_NX_OK) {
+                    started++;
+                    char msg[96];
+                    snprintf(msg, sizeof(msg),
+                             "USB Mic P%d: %s %04X:%04X",
+                             p + 1, g_players[p].last_name,
+                             g_players[p].last_vid, g_players[p].last_pid);
+                    osd("usb_mic_conn", msg, 5.0f);
+                }
+                break;
+            }
+            if (started >= MIC_NX_PLAYERS) return started;
         }
+        if (started > 0) return started;
     }
+    return started;
 }
+
+/* =========================================================================
+ * Hotplug
+ * ========================================================================= */
 
 static void *hotplug_thread(void *arg)
 {
     (void)arg;
-    /* Initial delay so UsbHs / dock power settle after boot. */
-    svcSleepThread(1500000000ULL);  /* 1.5 s */
+    svcSleepThread(1000000000ULL); /* 1 s settle */
 
     while (!g_hotplug_stop) {
-        try_hotplug();
-        /* Poll every 1.5 s */
-        for (int i = 0; i < 15 && !g_hotplug_stop; i++)
-            svcSleepThread(100000000ULL);  /* 100 ms * 15 */
+        if (!mic_nx_any_connected())
+            try_probe_all();
+
+        for (int i = 0; i < 20 && !g_hotplug_stop; i++)
+            svcSleepThread(100000000ULL); /* 100 ms * 20 = 2 s */
     }
     return NULL;
 }
@@ -416,49 +490,43 @@ int mic_nx_init(void)
     }
 
     mutexLock(&g_init_mutex);
-
     if (g_init_done) {
         mutexUnlock(&g_init_mutex);
         return MIC_NX_ERR_BUSY;
     }
 
-    int any_ok = 0;
-
     for (int i = 0; i < MIC_NX_PLAYERS; i++) {
-        MicPlayer *p = &g_players[i];
-        memset(p, 0, sizeof(*p));
-        p->player = i;
-        p->vol    = 240;
-        ring_init(&p->ring);
-
-        p->xfer_buf = (uint8_t *)aligned_alloc(0x1000, ISO_XFER_SIZE);
-        if (!p->xfer_buf) continue;
-        memset(p->xfer_buf, 0, ISO_XFER_SIZE);
-
-        if (start_player(p) == MIC_NX_OK) {
-            any_ok = 1;
-            char msg[96];
-            snprintf(msg, sizeof(msg),
-                     "USB Mic P%d connected (%s %04x:%04x)",
-                     i + 1, p->last_name, p->last_vid, p->last_pid);
-            osd("usb_mic_conn", msg, 4.0f);
-        }
+        memset(&g_players[i], 0, sizeof(g_players[i]));
+        g_players[i].player = i;
+        g_players[i].vol = 240;
+        ring_init(&g_players[i].ring);
     }
+
+    ensure_usbhs();
+    setup_available_event();
+
+    /* Give the dock / host controller a moment after storage init. */
+    svcSleepThread(500000000ULL); /* 0.5 s */
+
+    int n = try_probe_all();
 
     g_init_done = 1;
 
-    /* Always start hotplug so late-docked mics are found. */
     g_hotplug_stop = 0;
     if (pthread_create(&g_hotplug_thread, NULL, hotplug_thread, NULL) == 0)
         g_hotplug_running = 1;
 
     mutexUnlock(&g_init_mutex);
 
-    if (!any_ok)
-        osd("usb_mic_none",
-            "USB Mic: no device yet (plug into dock USB-A)", 5.0f);
-
-    return any_ok ? MIC_NX_OK : MIC_NX_ERR_NODEV;
+    if (n == 0) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "USB Mic: none (%s). Dock + USB-A, wait 2s",
+                 g_last_diag);
+        osd("usb_mic_none", msg, 8.0f);
+        return MIC_NX_ERR_NODEV;
+    }
+    return MIC_NX_OK;
 }
 
 void mic_nx_exit(void)
@@ -478,13 +546,13 @@ void mic_nx_exit(void)
     }
 
     for (int i = 0; i < MIC_NX_PLAYERS; i++) {
-        MicPlayer *p = &g_players[i];
-        release_player(p);
-        if (p->xfer_buf) {
-            free(p->xfer_buf);
-            p->xfer_buf = NULL;
-        }
+        release_player(&g_players[i]);
+        free(g_players[i].xfer_buf);
+        g_players[i].xfer_buf = NULL;
     }
+
+    teardown_available_event();
+    /* Do NOT call usbHsExit() - libusbhsfs / other code may still need it. */
 
     g_init_done = 0;
     mutexUnlock(&g_init_mutex);
@@ -527,5 +595,6 @@ void mic_nx_set_volume(int player, uint8_t vol)
 void mic_nx_poll(void)
 {
     if (!g_init_done) return;
-    try_hotplug();
+    if (!mic_nx_any_connected())
+        try_probe_all();
 }
