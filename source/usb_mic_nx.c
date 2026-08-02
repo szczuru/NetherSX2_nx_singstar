@@ -468,43 +468,31 @@ static int start_player_from_iface(MicPlayer *p, UsbHsInterface *iface)
     return MIC_NX_OK;
 }
 
-static int try_probe_all(void)
+/* Held Audio-Control session (SingStar needs AC claimed before AS appears). */
+static UsbHsClientIfSession g_ac_iface;
+static int g_ac_held = 0;
+
+static void release_ac_hold(void)
 {
-    UsbHsInterface ifaces[MAX_IFACES];
-    memset(ifaces, 0, sizeof(ifaces));
-    Result qrc = 0;
-    s32 total = query_audio_interfaces(ifaces, MAX_IFACES, &qrc);
-
-    if (total <= 0) {
-        snprintf(g_last_diag, sizeof(g_last_diag),
-                 "USB q:rc=0x%08X n=%d", (unsigned)qrc, (int)total);
-        return 0;
+    if (g_ac_held) {
+        usbHsIfClose(&g_ac_iface);
+        g_ac_held = 0;
     }
+}
 
-    /* Describe first interface for diagnostics */
-    u8 cls0 = ifaces[0].inf.interface_desc.bInterfaceClass;
-    u8 sub0 = ifaces[0].inf.interface_desc.bInterfaceSubClass;
-    u8 numep = ifaces[0].inf.interface_desc.bNumEndpoints;
-    u16 vid0 = ifaces[0].device_desc.idVendor;
-    u16 pid0 = ifaces[0].device_desc.idProduct;
-
+static int try_start_on_list(UsbHsInterface *ifaces, s32 total, int *last_fail)
+{
     int started = 0;
-    int attempts = 0;
-    int last_fail = 0;
-
-    /* Pass 0: AudioStreaming only; pass 1: any Audio */
     for (int pass = 0; pass < 2; pass++) {
         for (s32 i = 0; i < total; i++) {
             u8 sub = ifaces[i].inf.interface_desc.bInterfaceSubClass;
             u8 cls = ifaces[i].inf.interface_desc.bInterfaceClass;
-            if (pass == 0 && !(cls == 0x01 && sub == 0x02))
-                continue;
-            if (pass == 1 && cls != 0x01)
-                continue;
+            /* pass0: AudioStreaming; pass1: any Audio */
+            if (pass == 0 && !(cls == 0x01 && sub == 0x02)) continue;
+            if (pass == 1 && cls != 0x01) continue;
 
             for (int p = 0; p < MIC_NX_PLAYERS; p++) {
                 if (g_players[p].active) continue;
-                attempts++;
                 if (start_player_from_iface(&g_players[p], &ifaces[i]) == MIC_NX_OK) {
                     started++;
                     char msg[96];
@@ -513,22 +501,169 @@ static int try_probe_all(void)
                              p + 1, g_players[p].last_name,
                              g_players[p].last_vid, g_players[p].last_pid);
                     osd("usb_mic_conn", msg, 5.0f);
-                } else {
-                    last_fail = g_last_fail_step;
+                } else if (last_fail) {
+                    *last_fail = g_last_fail_step;
                 }
                 break;
             }
-            if (started >= MIC_NX_PLAYERS) break;
+            if (started >= MIC_NX_PLAYERS) return started;
         }
-        if (started > 0) break;
+        if (started > 0) return started;
+    }
+    return started;
+}
+
+static s32 query_by_vid(uint16_t vid, UsbHsInterface *out, s32 max_count)
+{
+    UsbHsInterfaceFilter f;
+    memset(&f, 0, sizeof(f));
+    f.Flags = (u16)UsbHsInterfaceFilterFlags_idVendor;
+    f.idVendor = vid;
+    s32 total = 0;
+    Result rc = usbHsQueryAvailableInterfaces(&f, out,
+                    (size_t)max_count * sizeof(UsbHsInterface), &total);
+    if (R_FAILED(rc)) return 0;
+    return total;
+}
+
+static s32 query_all_by_vid(uint16_t vid, UsbHsInterface *out, s32 max_count)
+{
+    UsbHsInterfaceFilter f;
+    memset(&f, 0, sizeof(f));
+    f.Flags = (u16)UsbHsInterfaceFilterFlags_idVendor;
+    f.idVendor = vid;
+    s32 total = 0;
+    Result rc = usbHsQueryAllInterfaces(&f, out,
+                    (size_t)max_count * sizeof(UsbHsInterface), &total);
+    if (R_FAILED(rc)) return 0;
+    return total;
+}
+
+static int try_probe_all(void)
+{
+    UsbHsInterface ifaces[MAX_IFACES];
+    memset(ifaces, 0, sizeof(ifaces));
+    Result qrc = 0;
+    s32 total = query_audio_interfaces(ifaces, MAX_IFACES, &qrc);
+
+    if (total <= 0) {
+        /* Also try pure VID query for SingStar */
+        total = query_by_vid(SINGSTAR_VID, ifaces, MAX_IFACES);
+        if (total <= 0)
+            total = query_all_by_vid(SINGSTAR_VID, ifaces, MAX_IFACES);
+    }
+
+    if (total <= 0) {
+        snprintf(g_last_diag, sizeof(g_last_diag),
+                 "USB q:rc=0x%08X n=%d", (unsigned)qrc, (int)total);
+        return 0;
+    }
+
+    u8 cls0 = ifaces[0].inf.interface_desc.bInterfaceClass;
+    u8 sub0 = ifaces[0].inf.interface_desc.bInterfaceSubClass;
+    u8 numep = ifaces[0].inf.interface_desc.bNumEndpoints;
+    u8 ifnum = ifaces[0].inf.interface_desc.bInterfaceNumber;
+    u16 vid0 = ifaces[0].device_desc.idVendor;
+    u16 pid0 = ifaces[0].device_desc.idProduct;
+
+    int last_fail = 0;
+    int started = try_start_on_list(ifaces, total, &last_fail);
+
+    /*
+     * SingStar exposes Audio Control first (01/01, ep=0). Claim it, then
+     * re-enumerate -- the Audio Streaming interface often only becomes
+     * available after AC is acquired.
+     */
+    if (started == 0 && vid0 == SINGSTAR_VID && !g_ac_held) {
+        for (s32 i = 0; i < total; i++) {
+            u8 cls = ifaces[i].inf.interface_desc.bInterfaceClass;
+            u8 sub = ifaces[i].inf.interface_desc.bInterfaceSubClass;
+            if (!(cls == 0x01 && sub == 0x01)) continue;
+
+            Result rc = usbHsAcquireUsbIf(&g_ac_iface, &ifaces[i]);
+            if (R_SUCCEEDED(rc)) {
+                g_ac_held = 1;
+                /* Nudge the device: select default AC setting */
+                usbHsIfSetInterface(&g_ac_iface, NULL, 0);
+                break;
+            }
+        }
+
+        if (g_ac_held) {
+            svcSleepThread(200000000ULL); /* 200 ms for re-enum */
+
+            memset(ifaces, 0, sizeof(ifaces));
+            s32 total2 = query_by_vid(SINGSTAR_VID, ifaces, MAX_IFACES);
+            if (total2 <= 0)
+                total2 = query_audio_interfaces(ifaces, MAX_IFACES, &qrc);
+            if (total2 <= 0)
+                total2 = query_all_by_vid(SINGSTAR_VID, ifaces, MAX_IFACES);
+
+            if (total2 > 0) {
+                cls0 = ifaces[0].inf.interface_desc.bInterfaceClass;
+                sub0 = ifaces[0].inf.interface_desc.bInterfaceSubClass;
+                numep = ifaces[0].inf.interface_desc.bNumEndpoints;
+                ifnum = ifaces[0].inf.interface_desc.bInterfaceNumber;
+                total = total2;
+                started = try_start_on_list(ifaces, total2, &last_fail);
+            }
+
+            /* If still nothing, try every alternate on the AC session itself
+             * (some stacks present streaming as alt of the same if). */
+            if (started == 0) {
+                for (u8 alt = 1; alt <= 3; alt++) {
+                    UsbHsInterfaceInfo altinf;
+                    memset(&altinf, 0, sizeof(altinf));
+                    Result arc = usbHsIfGetAlternateInterface(&g_ac_iface, &altinf, alt);
+                    if (R_FAILED(arc)) continue;
+
+                    /* Build a temporary session by reusing AC: set alt, open EP */
+                    usbHsIfSetInterface(&g_ac_iface, NULL, alt);
+                    usbHsIfGetInterface(&g_ac_iface, NULL);
+
+                    /* Steal player 0's ep open against AC iface */
+                    MicPlayer *p = &g_players[0];
+                    if (p->active) break;
+                    if (!p->xfer_buf) {
+                        p->xfer_buf = (uint8_t *)aligned_alloc(0x1000, ISO_XFER_SIZE);
+                        if (!p->xfer_buf) break;
+                        memset(p->xfer_buf, 0, ISO_XFER_SIZE);
+                    }
+                    /* Borrow AC session as the player's iface */
+                    p->iface = g_ac_iface;
+                    p->iface_open = 1;
+                    g_ac_held = 0; /* ownership transferred */
+
+                    if (open_iso_ep(&p->ep, &p->iface) == 0) {
+                        p->ep_open = 1;
+                        p->last_vid = vid0;
+                        p->last_pid = pid0;
+                        snprintf(p->last_name, sizeof(p->last_name), "SingStar");
+                        p->stop_flag = 0;
+                        if (pthread_create(&p->thread, NULL, capture_thread, p) == 0) {
+                            p->active = 1;
+                            started = 1;
+                            osd("usb_mic_conn", "USB Mic P1: SingStar (alt)", 5.0f);
+                            break;
+                        }
+                        release_player(p);
+                    } else {
+                        /* give AC back */
+                        g_ac_iface = p->iface;
+                        p->iface_open = 0;
+                        g_ac_held = 1;
+                        last_fail = 3;
+                    }
+                }
+            }
+        }
     }
 
     if (started == 0) {
-        /* fail step: 1=alloc 2=acquire 3=endpoint 4=thread */
         snprintf(g_last_diag, sizeof(g_last_diag),
-                 "n=%d %04X:%04X cls=%02X/%02X ep=%u fail=%d rc=0x%X",
-                 (int)total, vid0, pid0, cls0, sub0, (unsigned)numep,
-                 last_fail, (unsigned)g_last_fail_rc);
+                 "n=%d %04X:%04X if=%u %02X/%02X ep=%u fail=%d ac=%d",
+                 (int)total, vid0, pid0, (unsigned)ifnum,
+                 cls0, sub0, (unsigned)numep, last_fail, g_ac_held);
     } else {
         snprintf(g_last_diag, sizeof(g_last_diag),
                  "ok n=%d started=%d", (int)total, started);
@@ -628,6 +763,7 @@ void mic_nx_exit(void)
         g_players[i].xfer_buf = NULL;
     }
 
+    release_ac_hold();
     teardown_available_event();
     /* Do NOT call usbHsExit() - libusbhsfs / other code may still need it. */
 
