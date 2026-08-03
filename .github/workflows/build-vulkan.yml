@@ -28,14 +28,17 @@ jobs:
       contents: write
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # ── 1. Checkout this repo into /repo (NOT /work — nxvk owns /work) ────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          path: repo
 
       - name: Fix git safe.directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/repo"
+          git config --global --add safe.directory /work
 
       # ── 2. System packages ─────────────────────────────────────────────────
       - name: Install system packages
@@ -52,9 +55,8 @@ jobs:
             'meson>=1.4' mako pyyaml
 
       # ── 3. Build SPIRV-Tools >= 2024.1 from source ─────────────────────────
-      # The system package (spirv-tools) is 2023.x; Mesa 26 requires >= 2024.1.
-      # We build 2024.4 and install it to /usr/local so pkg-config finds it
-      # before the system version.
+      # System package is 2023.x; Mesa 26 requires >= 2024.1.
+      # Install to /usr/local so pkg-config finds it before the system version.
       - name: Cache SPIRV-Tools 2024.4
         id: spirv-cache
         uses: actions/cache@v4
@@ -67,14 +69,10 @@ jobs:
         run: |
           git clone --depth 1 -b v2024.4 \
             https://github.com/KhronosGroup/SPIRV-Tools.git /tmp/spirv-src
-
-          # Pin SPIRV-Headers to the revision SPIRV-Tools 2024.4 was tested with
-          HEADERS_REV=$(grep -oE "spirv_headers_revision.*'[0-9a-f]{40}'" \
-            /tmp/spirv-src/DEPS | grep -oE "[0-9a-f]{40}" | head -1)
+          HEADERS_REV=$(grep -oE "[0-9a-f]{40}" /tmp/spirv-src/DEPS | head -1)
           git clone https://github.com/KhronosGroup/SPIRV-Headers.git \
             /tmp/spirv-src/external/spirv-headers
           git -C /tmp/spirv-src/external/spirv-headers checkout "$HEADERS_REV"
-
           cmake -S /tmp/spirv-src -B /tmp/spirv-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -83,15 +81,13 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -G Ninja
           ninja -C /tmp/spirv-src/build -j$(nproc) install
-
-      - name: Verify SPIRV-Tools version seen by pkg-config
-        run: |
-          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
-          pkg-config --modversion SPIRV-Tools
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH" \
-            >> $GITHUB_ENV
-          # Also update ldconfig so shared libs are found at runtime
           ldconfig
+
+      - name: Set PKG_CONFIG_PATH for newer SPIRV-Tools
+        run: |
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+            >> $GITHUB_ENV
+          pkg-config --modversion SPIRV-Tools
 
       # ── 4. Rust nightly ────────────────────────────────────────────────────
       - name: Install Rust
@@ -107,11 +103,15 @@ jobs:
           rustup target add aarch64-unknown-none
           cargo install --locked bindgen-cli cbindgen
 
-      # ── 5. Clone nxvk ─────────────────────────────────────────────────────
-      - name: Clone nxvk
+      # ── 5. Clone nxvk into /work ───────────────────────────────────────────
+      # nxvk's cross-files hard-code /work as the repo root:
+      #   rust.cross:       rust = ['/work/switch/rust/rustc-switch.sh']
+      #   rustc-switch.sh:  --sysroot /work/switch/rust/sysroot
+      # The clone MUST be to /work, not /work/nxvk.
+      - name: Clone nxvk into /work
         run: |
           git clone --depth 1 -b ${{ inputs.nxvk_ref }} \
-            https://github.com/PalindromicBreadLoaf/nxvk.git /work/nxvk
+            https://github.com/PalindromicBreadLoaf/nxvk.git /work
 
       # ── 6. Set up /opt/switch-cross-include ────────────────────────────────
       - name: Set up cross-include
@@ -120,19 +120,15 @@ jobs:
           cp /usr/include/xf86drm.h \
              /usr/include/xf86drmMode.h \
              /opt/switch-cross-include/ 2>/dev/null || true
-          cp -r /usr/include/libdrm/. \
-                /opt/switch-cross-include/ 2>/dev/null || true
-          cp -r /usr/include/libdrm/. \
-                /opt/switch-cross-include/libdrm/ 2>/dev/null || true
-          cp -r /work/nxvk/switch/docker/cross-include/. \
-                /opt/switch-cross-include/
+          cp -r /usr/include/libdrm/. /opt/switch-cross-include/ 2>/dev/null || true
+          cp -r /usr/include/libdrm/. /opt/switch-cross-include/libdrm/ 2>/dev/null || true
+          cp -r /work/switch/docker/cross-include/. /opt/switch-cross-include/
 
       # ── 7. Bake SPIR-V pkg-config into devkitPro search path ──────────────
       - name: Bake pkg-config files
         run: |
           XDIR=/opt/devkitpro/portlibs/switch/lib/pkgconfig
           mkdir -p "$XDIR"
-          # Prefer the freshly built /usr/local versions over system ones
           for name in libclc LLVMSPIRVLib SPIRV-Tools SPIRV-Tools-shared SPIRV-Headers; do
             f=$(find /usr/local/lib/pkgconfig /usr/lib/pkgconfig /usr/share/pkgconfig \
                   -name "$name.pc" 2>/dev/null | head -1)
@@ -150,7 +146,7 @@ jobs:
 
       # ── 9. Build native tools ──────────────────────────────────────────────
       - name: Build native tools
-        working-directory: /work/nxvk
+        working-directory: /work
         run: |
           . "$HOME/.cargo/env"
           export LLVM_CONFIG=/usr/bin/llvm-config-15
@@ -159,12 +155,12 @@ jobs:
 
       # ── 10. Configure Mesa cross-build ─────────────────────────────────────
       - name: Configure Mesa
-        working-directory: /work/nxvk
+        working-directory: /work
         run: |
           . "$HOME/.cargo/env"
           export LLVM_CONFIG=/usr/bin/llvm-config-15
           export LIBCLANG_PATH=/usr/lib/llvm-15/lib
-          export PATH="/work/nxvk/switch/build/native-tools/bin:$PATH"
+          export PATH="/work/switch/build/native-tools/bin:$PATH"
           bash switch/build/configure-mesa.sh
 
       # ── 11. Cache Cargo artifacts ──────────────────────────────────────────
@@ -174,17 +170,17 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: nvk-cargo-${{ inputs.nxvk_ref }}-${{ hashFiles('/work/nxvk/Cargo.lock') }}
+          key: nvk-cargo-${{ inputs.nxvk_ref }}-${{ hashFiles('/work/Cargo.lock') }}
           restore-keys: nvk-cargo-${{ inputs.nxvk_ref }}-
 
       # ── 12. Build Mesa NVK ─────────────────────────────────────────────────
       - name: Build Mesa NVK
-        working-directory: /work/nxvk
+        working-directory: /work
         run: |
           . "$HOME/.cargo/env"
           export LLVM_CONFIG=/usr/bin/llvm-config-15
           export LIBCLANG_PATH=/usr/lib/llvm-15/lib
-          export PATH="/work/nxvk/switch/build/native-tools/bin:$PATH"
+          export PATH="/work/switch/build/native-tools/bin:$PATH"
           ninja -k0 -C switch/build/cross \
             src/nouveau/vulkan/libvulkan_nouveau.so || true
           echo "=== Archives produced ==="
@@ -194,11 +190,11 @@ jobs:
       - name: Package vulkan/ directory
         run: |
           set -eux
-          BUILD=/work/nxvk/switch/build/cross
-          OUT=$GITHUB_WORKSPACE/vulkan
+          BUILD=/work/switch/build/cross
+          OUT=$GITHUB_WORKSPACE/repo/vulkan
           mkdir -p "$OUT/lib" "$OUT/include/vulkan"
 
-          find /work/nxvk/include/vulkan -name '*.h' \
+          find /work/include/vulkan -name '*.h' \
             -exec cp {} "$OUT/include/vulkan/" \;
           find "$BUILD" -name '*.a' -exec cp {} "$OUT/lib/" \;
 
@@ -212,6 +208,7 @@ jobs:
 
       # ── 14. Publish as release asset ───────────────────────────────────────
       - name: Create vulkan.tar.gz
+        working-directory: ${{ github.workspace }}/repo
         run: tar -czf vulkan.tar.gz vulkan/
 
       - name: Publish as vulkan-bundle release
@@ -228,4 +225,4 @@ jobs:
             **Consumed automatically by `build.yml` — no manual download needed.**
 
             To update Mesa, re-run the **Build Vulkan bundle** workflow.
-          files: vulkan.tar.gz
+          files: ${{ github.workspace }}/repo/vulkan.tar.gz
