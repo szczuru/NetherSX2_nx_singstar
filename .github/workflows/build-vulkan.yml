@@ -164,7 +164,7 @@ jobs:
 
           rm -rf /tmp/stdsr
           mkdir -p /tmp/stdsr/src
-          echo '#![no_main]' > /tmp/stdsr/src/lib.rs
+          printf '#![no_std]\n#![no_main]\n' > /tmp/stdsr/src/lib.rs
           cat > /tmp/stdsr/Cargo.toml << 'TOML'
           [package]
           name = "stdsr"
