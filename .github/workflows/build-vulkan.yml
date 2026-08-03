@@ -144,7 +144,19 @@ jobs:
           /opt/devkitpro/devkitA64/bin/aarch64-none-elf-ar rcs \
             /opt/devkitpro/portlibs/switch/lib/libdl.a
 
-      # ── 9. Build native tools ──────────────────────────────────────────────
+      # ── 9. Build Rust std sysroot for aarch64-switch-horizon ─────────────────
+      # Must run BEFORE configure-mesa.sh — meson's Rust sanity check calls
+      # rustc-switch.sh --sysroot /work/switch/rust/sysroot and fails if the
+      # sysroot is missing (error E0462/E0463 "can't find crate for std").
+      - name: Build Rust sysroot
+        working-directory: /work
+        run: |
+          . "$HOME/.cargo/env"
+          export RUST_TARGET_PATH=/work/switch/rust
+          export RUSTC_BOOTSTRAP=1
+          bash switch/rust/build-std-sysroot.sh
+
+      # ── 10. Build native tools ─────────────────────────────────────────────
       - name: Build native tools
         working-directory: /work
         run: |
@@ -153,7 +165,7 @@ jobs:
           export LIBCLANG_PATH=/usr/lib/llvm-15/lib
           bash switch/build/build-native-tools.sh
 
-      # ── 10. Configure Mesa cross-build ─────────────────────────────────────
+      # ── 11. Configure Mesa cross-build ─────────────────────────────────────
       - name: Configure Mesa
         working-directory: /work
         run: |
@@ -163,7 +175,7 @@ jobs:
           export PATH="/work/switch/build/native-tools/bin:$PATH"
           bash switch/build/configure-mesa.sh
 
-      # ── 11. Cache Cargo artifacts ──────────────────────────────────────────
+      # ── 12. Cache Cargo artifacts ──────────────────────────────────────────
       - name: Cache Cargo artifacts
         uses: actions/cache@v4
         with:
@@ -173,7 +185,7 @@ jobs:
           key: nvk-cargo-${{ inputs.nxvk_ref }}-${{ hashFiles('/work/Cargo.lock') }}
           restore-keys: nvk-cargo-${{ inputs.nxvk_ref }}-
 
-      # ── 12. Build Mesa NVK ─────────────────────────────────────────────────
+      # ── 13. Build Mesa NVK ─────────────────────────────────────────────────
       - name: Build Mesa NVK
         working-directory: /work
         run: |
@@ -186,7 +198,7 @@ jobs:
           echo "=== Archives produced ==="
           find switch/build/cross -name '*.a' | sort
 
-      # ── 13. Package vulkan/ ────────────────────────────────────────────────
+      # ── 14. Package vulkan/ ────────────────────────────────────────────────
       - name: Package vulkan/ directory
         run: |
           set -eux
@@ -206,7 +218,7 @@ jobs:
           test -f "$OUT/lib/libnvk.a" || \
             { echo "ERROR: libnvk.a missing"; exit 1; }
 
-      # ── 14. Publish as release asset ───────────────────────────────────────
+      # ── 15. Publish as release asset ───────────────────────────────────────
       - name: Create vulkan.tar.gz
         working-directory: ${{ github.workspace }}/repo
         run: tar -czf vulkan.tar.gz vulkan/
