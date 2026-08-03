@@ -21,8 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
 
-    # devkitPro Docker image — devkitA64 + libnx already present, no apt
-    # installer needed. Runs as root inside the container.
     container:
       image: devkitpro/devkita64:latest
 
@@ -30,7 +28,7 @@ jobs:
       contents: write
 
     steps:
-      # ── 1. Checkout (needed later for the release upload) ──────────────────
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -39,7 +37,7 @@ jobs:
       - name: Fix git safe.directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      # ── 2. Install build dependencies (mirrors nxvk Dockerfile) ───────────
+      # ── 2. System packages ─────────────────────────────────────────────────
       - name: Install system packages
         run: |
           apt-get update -qq
@@ -48,12 +46,54 @@ jobs:
             build-essential cmake ninja-build \
             llvm-15-dev clang-15 libclang-15-dev \
             libclc-15-dev libclc-15 \
-            llvm-spirv-15 libllvmspirvlib-15-dev spirv-tools \
+            llvm-spirv-15 libllvmspirvlib-15-dev \
             libdrm-dev glslang-tools
           python3 -m pip install --break-system-packages --no-cache-dir \
             'meson>=1.4' mako pyyaml
 
-      # ── 3. Install Rust nightly ────────────────────────────────────────────
+      # ── 3. Build SPIRV-Tools >= 2024.1 from source ─────────────────────────
+      # The system package (spirv-tools) is 2023.x; Mesa 26 requires >= 2024.1.
+      # We build 2024.4 and install it to /usr/local so pkg-config finds it
+      # before the system version.
+      - name: Cache SPIRV-Tools 2024.4
+        id: spirv-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/pkgconfig/SPIRV-Tools*.pc
+          key: spirv-tools-2024.4-debian12-v1
+
+      - name: Build and install SPIRV-Tools 2024.4
+        if: steps.spirv-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 -b v2024.4 \
+            https://github.com/KhronosGroup/SPIRV-Tools.git /tmp/spirv-src
+
+          # Pin SPIRV-Headers to the revision SPIRV-Tools 2024.4 was tested with
+          HEADERS_REV=$(grep -oE "spirv_headers_revision.*'[0-9a-f]{40}'" \
+            /tmp/spirv-src/DEPS | grep -oE "[0-9a-f]{40}" | head -1)
+          git clone https://github.com/KhronosGroup/SPIRV-Headers.git \
+            /tmp/spirv-src/external/spirv-headers
+          git -C /tmp/spirv-src/external/spirv-headers checkout "$HEADERS_REV"
+
+          cmake -S /tmp/spirv-src -B /tmp/spirv-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DSPIRV_SKIP_TESTS=ON \
+            -DSPIRV_WERROR=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -G Ninja
+          ninja -C /tmp/spirv-src/build -j$(nproc) install
+
+      - name: Verify SPIRV-Tools version seen by pkg-config
+        run: |
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+          pkg-config --modversion SPIRV-Tools
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH" \
+            >> $GITHUB_ENV
+          # Also update ldconfig so shared libs are found at runtime
+          ldconfig
+
+      # ── 4. Rust nightly ────────────────────────────────────────────────────
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -67,13 +107,13 @@ jobs:
           rustup target add aarch64-unknown-none
           cargo install --locked bindgen-cli cbindgen
 
-      # ── 4. Clone nxvk ─────────────────────────────────────────────────────
+      # ── 5. Clone nxvk ─────────────────────────────────────────────────────
       - name: Clone nxvk
         run: |
           git clone --depth 1 -b ${{ inputs.nxvk_ref }} \
             https://github.com/PalindromicBreadLoaf/nxvk.git /work/nxvk
 
-      # ── 5. Set up /opt/switch-cross-include (mirrors Dockerfile) ──────────
+      # ── 6. Set up /opt/switch-cross-include ────────────────────────────────
       - name: Set up cross-include
         run: |
           mkdir -p /opt/switch-cross-include/libdrm
@@ -87,26 +127,28 @@ jobs:
           cp -r /work/nxvk/switch/docker/cross-include/. \
                 /opt/switch-cross-include/
 
-      # ── 6. Bake SPIR-V pkg-config files into devkitPro search path ────────
+      # ── 7. Bake SPIR-V pkg-config into devkitPro search path ──────────────
       - name: Bake pkg-config files
         run: |
           XDIR=/opt/devkitpro/portlibs/switch/lib/pkgconfig
           mkdir -p "$XDIR"
+          # Prefer the freshly built /usr/local versions over system ones
           for name in libclc LLVMSPIRVLib SPIRV-Tools SPIRV-Tools-shared SPIRV-Headers; do
-            f=$(find /usr -name "$name.pc" 2>/dev/null | head -1)
+            f=$(find /usr/local/lib/pkgconfig /usr/lib/pkgconfig /usr/share/pkgconfig \
+                  -name "$name.pc" 2>/dev/null | head -1)
             if [ -n "$f" ]; then
               cp "$f" "$XDIR/"
               echo "baked $f"
             fi
           done
 
-      # ── 7. Create empty libdl.a stub ───────────────────────────────────────
+      # ── 8. libdl.a stub ────────────────────────────────────────────────────
       - name: Create libdl.a stub
         run: |
           /opt/devkitpro/devkitA64/bin/aarch64-none-elf-ar rcs \
             /opt/devkitpro/portlibs/switch/lib/libdl.a
 
-      # ── 8. Build native tools (mesa_clc, glsl_compiler, etc.) ─────────────
+      # ── 9. Build native tools ──────────────────────────────────────────────
       - name: Build native tools
         working-directory: /work/nxvk
         run: |
@@ -115,7 +157,7 @@ jobs:
           export LIBCLANG_PATH=/usr/lib/llvm-15/lib
           bash switch/build/build-native-tools.sh
 
-      # ── 9. Configure Mesa cross-build ──────────────────────────────────────
+      # ── 10. Configure Mesa cross-build ─────────────────────────────────────
       - name: Configure Mesa
         working-directory: /work/nxvk
         run: |
@@ -125,8 +167,8 @@ jobs:
           export PATH="/work/nxvk/switch/build/native-tools/bin:$PATH"
           bash switch/build/configure-mesa.sh
 
-      # ── 10. Cache Rust/cargo artifacts ─────────────────────────────────────
-      - name: Cache Rust build artifacts
+      # ── 11. Cache Cargo artifacts ──────────────────────────────────────────
+      - name: Cache Cargo artifacts
         uses: actions/cache@v4
         with:
           path: |
@@ -135,9 +177,7 @@ jobs:
           key: nvk-cargo-${{ inputs.nxvk_ref }}-${{ hashFiles('/work/nxvk/Cargo.lock') }}
           restore-keys: nvk-cargo-${{ inputs.nxvk_ref }}-
 
-      # ── 11. Build Mesa NVK archives ────────────────────────────────────────
-      # The final .so link fails by design (missing Switch libc symbols).
-      # || true lets all .a archives build regardless.
+      # ── 12. Build Mesa NVK ─────────────────────────────────────────────────
       - name: Build Mesa NVK
         working-directory: /work/nxvk
         run: |
@@ -150,10 +190,7 @@ jobs:
           echo "=== Archives produced ==="
           find switch/build/cross -name '*.a' | sort
 
-      # ── 12. Package vulkan/ directory ──────────────────────────────────────
-      # NetherSX2 Makefile expects:
-      #   vulkan/include/vulkan/*.h
-      #   vulkan/lib/*.a
+      # ── 13. Package vulkan/ ────────────────────────────────────────────────
       - name: Package vulkan/ directory
         run: |
           set -eux
@@ -163,7 +200,6 @@ jobs:
 
           find /work/nxvk/include/vulkan -name '*.h' \
             -exec cp {} "$OUT/include/vulkan/" \;
-
           find "$BUILD" -name '*.a' -exec cp {} "$OUT/lib/" \;
 
           echo "=== vulkan/lib ==="
@@ -174,7 +210,7 @@ jobs:
           test -f "$OUT/lib/libnvk.a" || \
             { echo "ERROR: libnvk.a missing"; exit 1; }
 
-      # ── 13. Publish as release asset ───────────────────────────────────────
+      # ── 14. Publish as release asset ───────────────────────────────────────
       - name: Create vulkan.tar.gz
         run: tar -czf vulkan.tar.gz vulkan/
 
